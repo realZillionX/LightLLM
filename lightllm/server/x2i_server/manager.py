@@ -272,7 +272,7 @@ class X2IManager:
             if request.operation == "init_weights_update_group":
                 payload["master_port"] = payload["master_ports"]["x2v"]
                 payload["world_size"] = payload["x2v_world_size"]
-                payload["rank_base"] = 1
+                payload["rank_base"] = int(payload.get("x2v_rank_base", 1))
             if request.operation == "init_weights_update_group":
                 data = self.rl_weight_receiver.init_group(payload, rank=payload["rank_base"])
                 closure = self.gen_pipe.rl_weight_closure()

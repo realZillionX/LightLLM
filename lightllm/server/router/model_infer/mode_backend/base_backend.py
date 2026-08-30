@@ -293,7 +293,8 @@ class ModeBackend:
         payload["master_port"] = payload["master_ports"]["language"]
         payload["world_size"] = payload["language_world_size"]
         payload["group_name"] = f"{payload.get('group_name', 'weight_update_group')}:language"
-        receipt = self.rl_weight_receiver.init_group(payload, rank=1 + self.global_rank)
+        rank_base = int(payload.get("language_rank_base", 1))
+        receipt = self.rl_weight_receiver.init_group(payload, rank=rank_base + self.global_rank)
         receipt["closure_names"] = sorted(self.rl_language_weight_names)
         return receipt
 

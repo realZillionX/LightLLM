@@ -947,6 +947,7 @@ class HttpServerManager:
 
     def rl_status(self):
         return {
+            "replica_id": int(os.getenv("MOVA_RL_REPLICA_ID", "0")),
             "paused": self.is_pause,
             "inflight_generation_sessions": self.generation_session_count,
             "active_policy_version": self.rl_active_policy_version,
@@ -988,11 +989,24 @@ class HttpServerManager:
             await self.pause_generation()
             self.rl_update_id = uuid.uuid4().hex
             payload = dict(payload)
+            replica_count = int(payload.get("replica_count", 1))
+            replica_index = int(payload.get("replica_index", 0))
+            if replica_count < 1 or not 0 <= replica_index < replica_count:
+                raise ValueError("invalid serving replica identity for weight publication")
+            if replica_count > 1 and (
+                self.args.tp != 1
+                or self.args.visual_dp * self.args.visual_tp != 1
+                or self.args.x2i_server_used_gpus != 1
+            ):
+                raise RuntimeError("multi-replica publication requires one-GPU language/vision/X2V consumers")
             payload.update(
                 {
-                    "language_world_size": 1 + self.args.tp,
-                    "vision_world_size": 1 + self.args.visual_dp * self.args.visual_tp,
-                    "x2v_world_size": 2,
+                    "language_world_size": 1 + replica_count,
+                    "vision_world_size": 1 + replica_count,
+                    "x2v_world_size": 1 + replica_count,
+                    "language_rank_base": 1 + replica_index,
+                    "vision_rank_base": 1 + replica_index,
+                    "x2v_rank_base": 1 + replica_index,
                 }
             )
             if payload.get("master_ports") is None:
@@ -1002,7 +1016,7 @@ class HttpServerManager:
                     "vision": base_port + 1,
                     "x2v": base_port + 2,
                 }
-            expected_world = 1 + self.args.tp + self.args.visual_dp * self.args.visual_tp + 1
+            expected_world = 1 + 3 * replica_count
             if int(payload["world_size"]) != expected_world:
                 raise ValueError(f"weight publisher world_size must be {expected_world}")
             receipts = await self._dispatch_rl_control("init_weights_update_group", payload)

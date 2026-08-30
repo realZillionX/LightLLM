@@ -200,7 +200,7 @@ class VisualManager:
             if request.operation == "init_weights_update_group":
                 payload["master_port"] = payload["master_ports"]["vision"]
                 payload["world_size"] = payload["vision_world_size"]
-                payload["rank_base"] = 1
+                payload["rank_base"] = int(payload.get("vision_rank_base", 1))
             results = await asyncio.gather(
                 *(
                     rpc.rl_control(request.operation, payload)
