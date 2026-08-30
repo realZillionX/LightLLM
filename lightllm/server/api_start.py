@@ -288,9 +288,14 @@ def normal_or_p_d_start(args):
     ports_locker.lock_port()
 
     node_world_size = args.tp // args.nnodes
+    replica_id = int(os.getenv("MOVA_RL_REPLICA_ID", "0"))
+    internal_port_start = 10000 + replica_id * 2048
+    if replica_id < 0 or internal_port_start >= 64000:
+        raise ValueError(f"MOVA_RL_REPLICA_ID {replica_id} has no internal port range")
     can_use_ports = alloc_can_use_network_port(
         num=15 + node_world_size + args.visual_dp * args.visual_tp + args.visual_dp + args.audio_dp,
         used_ports=already_uesd_ports,
+        from_port_num=internal_port_start,
     )
     logger.info(f"alloced ports: {can_use_ports}")
     (
