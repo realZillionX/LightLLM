@@ -90,8 +90,8 @@ class RLRolloutRequest(BaseModel):
     modality: Literal["ti2t", "ti2ti"]
     messages: list[Message]
     seeds: list[int] = Field(min_length=1)
-    max_sequence_length: int = Field(default=8192, gt=1)
-    max_new_tokens: int = Field(default=4096, gt=0)
+    max_sequence_length: int = Field(default=12288, gt=1)
+    max_new_tokens: int = Field(default=6144, gt=0)
     max_images: int = Field(default=1, ge=0)
     temperature: float = 1.0
     top_p: float = 1.0
