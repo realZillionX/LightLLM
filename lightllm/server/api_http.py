@@ -65,6 +65,7 @@ from .api_models import (
 )
 from .build_prompt import build_prompt, init_tokenizer
 from .rl_models import (
+    CommitWeightsUpdateRequest,
     DestroyWeightsUpdateGroupRequest,
     DistributedWeightsRequest,
     InitWeightsUpdateGroupRequest,
@@ -340,6 +341,14 @@ async def update_weights_from_distributed(request: DistributedWeightsRequest):
 async def update_weights_from_tensor(request: TensorWeightsRequest):
     try:
         return await g_objs.httpserver_manager.update_weights_from_tensor(request.model_dump())
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/commit_weights_update")
+async def commit_weights_update(request: CommitWeightsUpdateRequest):
+    try:
+        return await g_objs.httpserver_manager.commit_weights_update(request.model_dump())
     except Exception as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

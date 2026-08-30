@@ -1034,12 +1034,9 @@ class HttpServerManager:
             self.rl_pending_policy_version = pending
             try:
                 receipts = await self._dispatch_rl_control("update_weights_from_distributed", dict(payload))
-                self.rl_active_policy_version = pending
-                self.rl_pending_policy_version = None
                 self.rl_last_receipts = receipts
                 self.rl_last_error = None
-                await self.continue_generation()
-                return {"policy_version": pending, "receipts": receipts}
+                return {"policy_version": pending, "receipts": receipts, "committed": False}
             except Exception as exc:
                 self.rl_last_error = str(exc)
                 # Deliberately remain paused: a consumer may already have copied
@@ -1056,15 +1053,29 @@ class HttpServerManager:
             self.rl_pending_policy_version = pending
             try:
                 receipts = await self._dispatch_rl_control("update_weights_from_tensor", dict(payload))
-                self.rl_active_policy_version = pending
-                self.rl_pending_policy_version = None
                 self.rl_last_receipts = receipts
                 self.rl_last_error = None
-                await self.continue_generation()
-                return {"policy_version": pending, "receipts": receipts}
+                return {"policy_version": pending, "receipts": receipts, "committed": False}
             except Exception as exc:
                 self.rl_last_error = str(exc)
                 raise
+
+    async def commit_weights_update(self, payload):
+        async with self.rl_control_lock:
+            pending = str(payload["policy_version"])
+            if not self.is_pause or self.rl_update_id is None:
+                raise RuntimeError("weight commit requires an initialized paused update")
+            if pending != self.rl_pending_policy_version:
+                raise ValueError(
+                    f"weight commit version {pending!r} differs from pending "
+                    f"{self.rl_pending_policy_version!r}"
+                )
+            if self.rl_last_receipts is None:
+                raise RuntimeError("weight commit has no consumer receipts")
+            self.rl_active_policy_version = pending
+            self.rl_pending_policy_version = None
+            await self.continue_generation()
+            return {"policy_version": pending, "committed": True}
 
     async def destroy_weights_update_group(self, payload):
         async with self.rl_control_lock:

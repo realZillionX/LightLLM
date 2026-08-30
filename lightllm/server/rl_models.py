@@ -41,6 +41,10 @@ class DestroyWeightsUpdateGroupRequest(BaseModel):
     group_name: str = "weight_update_group"
 
 
+class CommitWeightsUpdateRequest(BaseModel):
+    policy_version: str = Field(min_length=1)
+
+
 class TensorWeightsRequest(BaseModel):
     serialized_safetensors: str
     assignments: dict[str, list[Literal["language", "vision", "x2v"]]] = Field(default_factory=dict)
