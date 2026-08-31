@@ -435,10 +435,27 @@ async def stream_rl_traces(websocket: WebSocket):
         missing = [bundle_id for bundle_id, path in pending if not os.path.isfile(path)]
         if missing:
             raise FileNotFoundError(f"trace bundles not found: {missing[:8]}")
+        ttl_seconds = int(os.getenv("MOVA_RL_TRACE_TTL", "3600"))
+        oldest_trace_age_seconds = max(
+            time.time() - os.path.getmtime(path) for _bundle_id, path in pending
+        )
+        logger.info(
+            json.dumps(
+                {
+                    "component": "lightllm.rl_trace_stream",
+                    "event": "trace_age",
+                    "bundle_count": len(pending),
+                    "oldest_trace_age_seconds": oldest_trace_age_seconds,
+                    "trace_ttl_seconds": ttl_seconds,
+                }
+            )
+        )
         await websocket.send_json(
             {
                 "schema": "mova.rl.sde_stream.v1",
                 "bundle_count": len(pending),
+                "oldest_trace_age_seconds": oldest_trace_age_seconds,
+                "trace_ttl_seconds": ttl_seconds,
             }
         )
         chunk_bytes = 8 * 1024 * 1024
