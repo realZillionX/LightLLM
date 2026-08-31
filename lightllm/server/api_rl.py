@@ -52,6 +52,21 @@ def _sde_config(policy) -> dict[str, Any]:
     return values
 
 
+def _image_context_tokens(manager: HttpServerManager, *, width: int, height: int) -> int:
+    """Return LM positions appended after an already-sampled ``<img>`` action."""
+
+    patch_size = int(manager.tokenizer.patch_size)
+    downsample_ratio = float(manager.tokenizer.downsample_ratio)
+    merge_size = int(1 / downsample_ratio)
+    token_width = width // (patch_size * merge_size)
+    token_height = height // (patch_size * merge_size)
+    if token_width < 1 or token_height < 1:
+        raise ValueError("generated image geometry has no language-model context tokens")
+    # The sampled text action already contributes <img>; the image branch
+    # appends its context grid and the closing </img> position.
+    return token_width * token_height + 1
+
+
 async def _one_rollout(
     request: RLRolloutRequest,
     seed: int,
@@ -90,13 +105,33 @@ async def _one_rollout(
     image_start_tag = manager.tokenizer.image_start_tag
     image_start_id = manager.tokenizer.image_start_id
     image_tag = manager.tokenizer.image_tag
+    expected_image_context_tokens = 0
+    if image_config is not None:
+        image_geometry = X2IParams()
+        image_geometry.init_from_image_config(image_config)
+        expected_image_context_tokens = _image_context_tokens(
+            manager,
+            width=int(image_geometry.width),
+            height=int(image_geometry.height),
+        )
     events: list[dict[str, Any]] = []
     remaining = request.max_new_tokens
     generated_images = 0
-    prompt_tokens = 0
+    initial_prompt_tokens: int | None = None
+    context_tokens: int | None = None
+    image_context_tokens = 0
+    text_only_tail = request.modality == "ti2t" or request.max_images == 0
     finish_reason = "length"
 
     while remaining > 0:
+        can_generate_image = request.modality == "ti2ti" and not text_only_tail
+        image_reserve = expected_image_context_tokens + 1 if can_generate_image else 0
+        span_sequence_limit = request.max_sequence_length - image_reserve
+        if context_tokens is not None and context_tokens >= span_sequence_limit:
+            text_only_tail = True
+            can_generate_image = False
+            image_reserve = 0
+            span_sequence_limit = request.max_sequence_length
         params = SamplingParams()
         kwargs: dict[str, Any] = {
             "do_sample": True,
@@ -108,7 +143,7 @@ async def _one_rollout(
             "seed": seed,
             "skip_special_tokens": False,
         }
-        if request.modality == "ti2t":
+        if not can_generate_image:
             kwargs["invalid_token_ids"] = [image_start_id]
         else:
             kwargs["stop_sequences"] = [image_start_tag]
@@ -119,7 +154,14 @@ async def _one_rollout(
         logprobs: list[float] = []
         text_parts: list[str] = []
         span_finish_reason = None
-        generator = manager.generate(prompt, params, multimodal.clone(), request=raw_request)
+        generator = manager.generate(
+            prompt,
+            params,
+            multimodal.clone(),
+            request=raw_request,
+            max_req_total_len=span_sequence_limit,
+        )
+        span_prompt_tokens = 0
         async for _, text, metadata, finish_status in generator:
             token_id = int(metadata["id"])
             logprob = float(metadata["logprob"])
@@ -131,11 +173,16 @@ async def _one_rollout(
                 text_parts.append(text)
             if finish_status.is_finished():
                 span_finish_reason = finish_status.get_finish_reason()
-                prompt_tokens = int(metadata.get("prompt_tokens", prompt_tokens))
+                span_prompt_tokens = int(metadata.get("prompt_tokens", span_prompt_tokens))
 
         if not token_ids:
             raise RuntimeError("LightLLM returned an empty rollout span")
+        if span_prompt_tokens < 1:
+            raise RuntimeError("LightLLM omitted RL prompt-token usage")
+        if initial_prompt_tokens is None:
+            initial_prompt_tokens = span_prompt_tokens
         remaining -= len(token_ids)
+        context_tokens = span_prompt_tokens + len(token_ids)
         output_text = "".join(text_parts)
         stopped_on_image = token_ids[-1] == image_start_id
         events.append(
@@ -145,19 +192,27 @@ async def _one_rollout(
                 "token_ids": token_ids,
                 "selected_token_logprobs": logprobs,
                 "response_mask": [True] * len(token_ids),
-                "stop_token": token_ids[-1] if span_finish_reason is not None else None,
+                "stop_token": (
+                    token_ids[-1]
+                    if stopped_on_image or span_finish_reason not in {None, "length"}
+                    else None
+                ),
                 "decoded_tokens": manager.tokenizer.decode(token_ids, skip_special_tokens=False),
             }
         )
 
         if not stopped_on_image:
+            if span_finish_reason == "length" and image_reserve and remaining > 0:
+                # The image-aware span intentionally stopped early so a late
+                # <img> action would still fit.  If no image was sampled, use
+                # that reserved tail for text while masking further images.
+                prompt += output_text
+                text_only_tail = True
+                continue
             finish_reason = span_finish_reason or ("length" if remaining == 0 else "stop")
             break
-        if request.modality != "ti2ti":
-            raise RuntimeError("TI2T emitted a masked image action")
-        if generated_images >= request.max_images:
-            finish_reason = "image_limit"
-            break
+        if not can_generate_image:
+            raise RuntimeError("LightLLM emitted a masked image action")
 
         prompt += output_text
         x2i_params = X2IParams()
@@ -174,6 +229,13 @@ async def _one_rollout(
         )
         if not isinstance(x2i_response, X2IResponse) or not x2i_response.images:
             raise RuntimeError("LightX2V returned no image for an image action")
+        actual_image_context_tokens = _image_context_tokens(
+            manager,
+            width=int(x2i_params.width),
+            height=int(x2i_params.height),
+        )
+        if context_tokens + len(x2i_response.images) * actual_image_context_tokens > request.max_sequence_length:
+            raise RuntimeError("generated image exceeded the RL max_sequence_length reserve")
         bundle_ids = x2i_response.trace_bundles or []
         if len(bundle_ids) != len(x2i_response.images):
             raise RuntimeError("LightX2V image and trace bundle counts differ")
@@ -206,18 +268,29 @@ async def _one_rollout(
                 {"type": "base64", "data": _normalize_image_b64_for_multimodal(encoded)}
             )
             generated_images += 1
+            image_context_tokens += actual_image_context_tokens
+            context_tokens += actual_image_context_tokens
+        if generated_images >= request.max_images:
+            text_only_tail = True
         if remaining == 0:
             finish_reason = "length"
             break
 
     completion_tokens = sum(len(event["token_ids"]) for event in events if event["type"] == "text")
+    if initial_prompt_tokens is None or context_tokens is None:
+        raise RuntimeError("RL rollout produced no measurable sequence")
+    sequence_tokens = initial_prompt_tokens + completion_tokens + image_context_tokens
+    if sequence_tokens != context_tokens or sequence_tokens > request.max_sequence_length:
+        raise RuntimeError("RL rollout violated its total sequence-length contract")
     return {
         "seed": seed,
         "finish_reason": finish_reason,
         "usage": {
-            "prompt_tokens": prompt_tokens,
+            "prompt_tokens": initial_prompt_tokens,
             "completion_tokens": completion_tokens,
             "image_count": generated_images,
+            "image_context_tokens": image_context_tokens,
+            "sequence_tokens": sequence_tokens,
         },
         "events": events,
     }

@@ -325,6 +325,7 @@ class HttpServerManager:
         multimodal_params: MultimodalParams,
         request: Request,
         is_health_req: bool = False,
+        max_req_total_len: Optional[int] = None,
         # 该参数只会在 nixl pd mode 中使用，用于上报一些信息给 pd_master
         nixl_pd_upload_websocket: ClientConnection = None,
         # 用于等待 pd_master 下发的交换信息
@@ -381,7 +382,11 @@ class HttpServerManager:
                 self.metric_client.counter_inc("lightllm_request_count")
                 self.metric_client.histogram_observe("lightllm_request_input_length", prompt_tokens)
                 self.metric_client.histogram_observe("lightllm_request_max_new_tokens", sampling_params.max_new_tokens)
-            prompt_ids = await self._check_and_repair_length(prompt_ids, sampling_params)
+            prompt_ids = await self._check_and_repair_length(
+                prompt_ids,
+                sampling_params,
+                max_req_total_len=max_req_total_len,
+            )
             self._log_stage_timing(
                 group_request_id,
                 start_time,
@@ -678,32 +683,45 @@ class HttpServerManager:
             raise ValueError(f"prompt format error, get type{type(prompt)}")
         return
 
-    async def _check_and_repair_length(self, prompt_ids: List[int], sampling_params: SamplingParams):
+    async def _check_and_repair_length(
+        self,
+        prompt_ids: List[int],
+        sampling_params: SamplingParams,
+        *,
+        max_req_total_len: Optional[int] = None,
+    ):
         if not prompt_ids:
             raise ValueError("prompt_ids is empty")
+        request_limit = self.max_req_total_len if max_req_total_len is None else max_req_total_len
+        if not isinstance(request_limit, int) or isinstance(request_limit, bool) or request_limit < 2:
+            raise ValueError("max_req_total_len must be an integer greater than one")
+        if request_limit > self.max_req_total_len:
+            raise ValueError(
+                f"request max_req_total_len={request_limit} exceeds server limit {self.max_req_total_len}"
+            )
         prompt_tokens = len(prompt_ids)
-        if prompt_tokens + sampling_params.max_new_tokens > self.max_req_total_len:
+        if prompt_tokens + sampling_params.max_new_tokens > request_limit:
             # use long_truncation_mode to truncate long input len req.
             if self.args.long_truncation_mode is None:
                 # 修改默认逻辑，如果 prompt_tokens + max_new_tokens 长度超过总的允许长度，则将
                 # 修改 max_new_tokens 的值，使其满足合法约束。
-                new_max_new_tokens = self.max_req_total_len - prompt_tokens
+                new_max_new_tokens = request_limit - prompt_tokens
                 if new_max_new_tokens > 0:
                     logger.debug(
                         f"the input prompt token len {prompt_tokens} + max_new_tokens"
-                        f"{sampling_params.max_new_tokens} > {self.max_req_total_len},"
+                        f"{sampling_params.max_new_tokens} > {request_limit},"
                         f"so change max_new_tokens to {new_max_new_tokens}"
                     )
                     sampling_params.max_new_tokens = new_max_new_tokens
                 else:
                     raise ValueError(
                         f"the input prompt token len {prompt_tokens} + max_new_tokens \
-                            {sampling_params.max_new_tokens} > {self.max_req_total_len}"
+                            {sampling_params.max_new_tokens} > {request_limit}"
                     )
             elif self.args.long_truncation_mode == "head":
-                prompt_ids = prompt_ids[-(self.max_req_total_len - sampling_params.max_new_tokens) :]
+                prompt_ids = prompt_ids[-(request_limit - sampling_params.max_new_tokens) :]
             elif self.args.long_truncation_mode == "center":
-                req_input_len = self.max_req_total_len - sampling_params.max_new_tokens
+                req_input_len = request_limit - sampling_params.max_new_tokens
                 prompt_ids = prompt_ids[0 : req_input_len // 2] + prompt_ids[-(req_input_len - req_input_len // 2) :]
                 prompt_tokens = len(prompt_ids)
                 assert prompt_tokens == req_input_len
@@ -712,9 +730,9 @@ class HttpServerManager:
 
         # last repaired
         req_total_len = len(prompt_ids) + sampling_params.max_new_tokens
-        if req_total_len > self.max_req_total_len:
+        if req_total_len > request_limit:
             raise ValueError(
-                f"the req total len (input len + output len) is too long > max_req_total_len:{self.max_req_total_len}"
+                f"the req total len (input len + output len) is too long > max_req_total_len:{request_limit}"
             )
 
         return prompt_ids
