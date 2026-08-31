@@ -84,7 +84,7 @@ class HttpServerManager:
         self.enable_multimodal = args.enable_multimodal
 
         if self.enable_multimodal:
-            self.cache_client = rpyc.connect("localhost", args.cache_port, config={"allow_pickle": True})
+            self.cache_client = rpyc.connect("127.0.0.1", args.cache_port, config={"allow_pickle": True})
             self.cache_client._channel.stream.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         if not self.args.disable_vision:

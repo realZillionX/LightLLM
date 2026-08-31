@@ -52,7 +52,7 @@ class AudioModelRpcServer(rpyc.Service):
             self.model.load_model(weight_dir, model_cfg)
             self.model = self.model.cuda()
 
-            self.cache_client = rpyc.connect("localhost", self.cache_port, config={"allow_pickle": True})
+            self.cache_client = rpyc.connect("127.0.0.1", self.cache_port, config={"allow_pickle": True})
             self.cache_client._channel.stream.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.cpu_embed_cache_client = CpuEmbedCacheClient(
                 create_meta_data=False,

@@ -77,7 +77,7 @@ class MetricClient(threading.Thread):
     def __init__(self, port):
         super().__init__()
         self.port = port
-        self.conn = rpyc.connect("localhost", self.port)
+        self.conn = rpyc.connect("127.0.0.1", self.port)
 
         def async_wrap(f):
             f = rpyc.async_(f)

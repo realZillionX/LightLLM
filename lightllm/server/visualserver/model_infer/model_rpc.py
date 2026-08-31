@@ -119,7 +119,7 @@ class VisualModelRpcServer(rpyc.Service):
                 consumer="vision", device=torch.device(f"cuda:{self.device_id}")
             )
             if not self.is_visual_only_mode:
-                self.cache_client = rpyc.connect("localhost", self.cache_port, config={"allow_pickle": True})
+                self.cache_client = rpyc.connect("127.0.0.1", self.cache_port, config={"allow_pickle": True})
                 self.cache_client._channel.stream.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.cpu_embed_cache_client = CpuEmbedCacheClient(create_meta_data=False, init_shm_data=False)
             else:
