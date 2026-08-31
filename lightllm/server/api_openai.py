@@ -697,6 +697,21 @@ def _apply_image_generation_stop(
     chat_request.stop = stop
 
 
+def _set_interleaved_completion_budget(
+    sampling_params: SamplingParams,
+    *,
+    total_completion_tokens: int,
+    used_completion_tokens: int,
+) -> bool:
+    """Apply one request-wide text ceiling across every interleaved span."""
+
+    remaining = total_completion_tokens - used_completion_tokens
+    if remaining <= 0:
+        return False
+    sampling_params.max_new_tokens = remaining
+    return True
+
+
 async def _chat_completion_image_only(
     request: ChatCompletionRequestV2,
     raw_request: Request,
@@ -785,11 +800,19 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
         response_images: List[MessageContent] = []
         prompt_tokens = 0
         completion_tokens = 0
+        total_completion_tokens = int(sampling_params.max_new_tokens)
         finish_reason: Optional[str] = "stop"
         group_request_id = None
         max_image_gen_num = 15 if not image_only else 1  # TODO: make this configurable
 
         while max_image_gen_num > 0:
+            if not _set_interleaved_completion_budget(
+                sampling_params,
+                total_completion_tokens=total_completion_tokens,
+                used_completion_tokens=completion_tokens,
+            ):
+                finish_reason = "length"
+                break
             max_image_gen_num -= 1
             need_call_x2i = False
             output_chunk = ""
@@ -876,11 +899,19 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
 
         prompt_tokens = 0
         completion_tokens = 0
+        total_completion_tokens = int(sampling_params.max_new_tokens)
         finish_reason = None
         group_request_id = None
         max_image_gen_num = 15 if not image_only else 1  # TODO: make this configurable
 
         while max_image_gen_num > 0:
+            if not _set_interleaved_completion_budget(
+                sampling_params,
+                total_completion_tokens=total_completion_tokens,
+                used_completion_tokens=completion_tokens,
+            ):
+                finish_reason = "length"
+                break
             max_image_gen_num -= 1
             need_call_x2i = False
             text_generator = g_objs.httpserver_manager.generate(
