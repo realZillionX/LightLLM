@@ -288,10 +288,16 @@ def normal_or_p_d_start(args):
     ports_locker.lock_port()
 
     node_world_size = args.tp // args.nnodes
-    replica_id = int(os.getenv("MOVA_RL_REPLICA_ID", "0"))
-    internal_port_start = 10000 + replica_id * 2048
-    if replica_id < 0 or internal_port_start >= 64000:
-        raise ValueError(f"MOVA_RL_REPLICA_ID {replica_id} has no internal port range")
+    # The externally visible replica id is global across serving nodes, while
+    # LightLLM's private ports only need to be unique inside this node.  Using
+    # the global id for both capped a multi-node replica set at 27 processes
+    # even though every node has an independent network namespace.
+    local_replica_id = int(os.getenv("MOVA_RL_LOCAL_REPLICA_ID", "0"))
+    internal_port_start = 10000 + local_replica_id * 2048
+    if local_replica_id < 0 or internal_port_start >= 64000:
+        raise ValueError(
+            f"MOVA_RL_LOCAL_REPLICA_ID {local_replica_id} has no internal port range"
+        )
     can_use_ports = alloc_can_use_network_port(
         num=15 + node_world_size + args.visual_dp * args.visual_tp + args.visual_dp + args.audio_dp,
         used_ports=already_uesd_ports,
