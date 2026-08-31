@@ -52,6 +52,21 @@ class CacheServer(rpyc.Service):
         return self._impl.get_items_embed(ids)
 
 
+def _serve_after_listening(server, pipe_writer) -> None:
+    """Signal readiness only after the RPyC listener is actually bound."""
+
+    server._listen()
+    server._register()
+    pipe_writer.send("init ok")
+    try:
+        while server.active:
+            server.accept()
+    except EOFError:
+        pass
+    finally:
+        server.close()
+
+
 def start_cache_manager(args: StartArgs, pipe_writer):
     # 注册graceful 退出的处理
     graceful_registry(inspect.currentframe().f_code.co_name)
@@ -63,8 +78,7 @@ def start_cache_manager(args: StartArgs, pipe_writer):
     import lightllm.utils.rpyc_fix_utils as _
 
     t = ThreadedServer(service, port=args.cache_port, protocol_config={"allow_pickle": True})
-    pipe_writer.send("init ok")
-    t.start()
+    _serve_after_listening(t, pipe_writer)
 
 
 if __name__ == "__main__":

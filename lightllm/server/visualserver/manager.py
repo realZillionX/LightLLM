@@ -225,12 +225,14 @@ def start_visual_process(args, pipe_writer):
     graceful_registry(inspect.currentframe().f_code.co_name)
     setproctitle.setproctitle(f"lightllm::{get_unique_server_name()}::visual_server")
     start_parent_check_thread()
+    visualserver = None
     try:
         visualserver = VisualManager(args=args)
         asyncio.run(visualserver.wait_to_model_ready())
     except Exception as e:
         logger.exception(str(e))
-        visualserver.clean_up()
+        if visualserver is not None:
+            visualserver.clean_up()
         raise e
 
     pipe_writer.send("init ok")
