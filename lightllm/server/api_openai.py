@@ -630,6 +630,7 @@ async def _get_text_generator_input(request: ChatCompletionRequest):
         "top_k": request.top_k,
         "ignore_eos": request.ignore_eos,
         "max_new_tokens": request.max_tokens,
+        "seed": request.seed,
         "stop_sequences": request.stop,
         "n": request.n,
         "best_of": request.n,
@@ -683,355 +684,194 @@ def _normalize_image_b64_for_multimodal(image: Union[str, bytes]) -> str:
     return image
 
 
-def _apply_image_generation_stop(
-    chat_request: ChatCompletionRequest, image_start_tag: str, image_only: bool = False
-) -> None:
-    stop = chat_request.stop or []
-    if isinstance(stop, str):
-        stop = [stop]
-    stop = list(stop)
-    if image_start_tag not in stop:
-        stop.append(image_start_tag)
-    if chat_request.chat_template_kwargs.get("enable_thinking", False) and image_only:
-        stop.append("</think>")  # TODO: from model config
-    chat_request.stop = stop
-
-
-def _set_interleaved_completion_budget(
-    sampling_params: SamplingParams,
-    *,
-    total_completion_tokens: int,
-    used_completion_tokens: int,
-) -> bool:
-    """Apply one request-wide text ceiling across every interleaved span."""
-
-    remaining = total_completion_tokens - used_completion_tokens
-    if remaining <= 0:
-        return False
-    sampling_params.max_new_tokens = remaining
-    return True
-
-
-async def _chat_completion_image_only(
-    request: ChatCompletionRequestV2,
-    raw_request: Request,
-    prompt: str,
-    multimodal_params: MultimodalParams,
-    x2i_params: X2IParams,
-) -> ChatCompletionResponse:
-    from .api_http import g_objs
-
-    created_time = int(time.time())
-    input_image_num = len(multimodal_params.images)
-    images = await g_objs.httpserver_manager.generate_image(
-        prompt, x2i_params, multimodal_params.clone(), request=raw_request, input_image_num=input_image_num
-    )
-    response_images = _message_contents_from_raw_images(images, request.image_config.image_type)
-    chat_message = ChatMessage(
-        role="assistant",
-        content="",
-        images=response_images if response_images else None,
-    )
-    choice = ChatCompletionResponseChoice(
-        index=0,
-        message=chat_message,
-        finish_reason="stop",
-    )
-    usage = UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0)
-    return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex}",
-        created=created_time,
-        model=request.model,
-        choices=[choice],
-        usage=usage,
-    )
-
-
 async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request: Request) -> Response:
+    """SenseNova inference with one total input/output context limit."""
     from .api_http import g_objs
+    from .trajectory_budget import require_server_limit, image_context_tokens, span_budget, prompt_token_count
 
-    if request.logit_bias is not None:
-        return create_error_response(
-            HTTPStatus.BAD_REQUEST,
-            "The logit_bias parameter is not currently supported",
-        )
-
-    if request.function_call != "none":
-        return create_error_response(HTTPStatus.BAD_REQUEST, "The function call feature is not supported")
-
-    if request.chat_template_kwargs is None:
-        request.chat_template_kwargs = {}
-
-    chat_request: ChatCompletionRequest = ChatCompletionRequest(**request.model_dump())
-
-    if "image" not in request.modalities:
-        return await chat_completions_impl(chat_request, raw_request)
-
+    manager = g_objs.httpserver_manager
+    if not manager.args.enable_multimodal_x2i:
+        return await chat_completions_impl(ChatCompletionRequest(**request.model_dump()), raw_request)
+    limit = require_server_limit(request.max_sequence_length, manager.max_req_total_len)
+    if request.logit_bias is not None or request.function_call != "none":
+        raise ValueError("SenseNova trajectory inference does not support logit bias or function calls")
     if request.n != 1:
-        return create_error_response(
-            HTTPStatus.BAD_REQUEST,
-            "multimodal image generation only supports n = 1",
-        )
-
-    image_start_tag = g_objs.httpserver_manager.tokenizer.image_start_tag
-    image_tag = g_objs.httpserver_manager.tokenizer.image_tag
+        raise ValueError("SenseNova trajectory inference requires n=1")
+    if {"max_tokens", "max_completion_tokens"} & request.model_fields_set:
+        raise ValueError("Use max_sequence_length; separate completion limits are not supported")
+    if request.image_config is not None and request.image_config.num_images not in (None, 1):
+        raise ValueError("Each image action generates exactly one image")
+    request.chat_template_kwargs = request.chat_template_kwargs or {}
+    chat_request = ChatCompletionRequest(**request.model_dump())
+    # This lower-level API requires a value; every span replaces it with the
+    # exact remaining context after multimodal encoding.
+    chat_request.max_tokens = limit
+    prompt, sampling, multimodal = await _get_text_generator_input(chat_request)
+    await multimodal.verify_and_preload(raw_request)
+    initial_tokens = prompt_token_count(manager, prompt, multimodal, sampling)
+    if initial_tokens >= limit:
+        raise ValueError(f"input uses {initial_tokens} tokens and leaves no room under total limit {limit}")
+    input_image_num = len(multimodal.images)
     image_only = request.modalities == ["image"]
+    image_enabled = "image" in request.modalities
+    max_images = min(request.max_images, 1) if image_only else request.max_images
+    image_start = manager.tokenizer.image_start_tag
+    image_id = manager.tokenizer.image_start_id
+    image_tag = manager.tokenizer.image_tag
+    image_params = X2IParams()
+    image_tokens = 0
+    if image_enabled:
+        image_params.init_from_image_config(request.image_config)
+        if input_image_num:
+            image_params.update_hw(multimodal.images[0].image_w, multimodal.images[0].image_h)
+        image_tokens = image_context_tokens(
+            manager.tokenizer, width=int(image_params.width), height=int(image_params.height)
+        )
+    request_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
 
-    _apply_image_generation_stop(chat_request, image_start_tag, image_only=image_only)
-
-    created_time = int(time.time())
-
-    prompt, sampling_params, multimodal_params = await _get_text_generator_input(chat_request)
-    input_image_num = len(multimodal_params.images)
-
-    x2i_params = X2IParams()
-    x2i_params.init_from_image_config(request.image_config)
-
-    enable_thinking = request.chat_template_kwargs.get("enable_thinking", False)
-    print(f"x2i_params: {x2i_params} {image_only} {enable_thinking}", flush=True)
-
-    if image_only and not enable_thinking:
-        return await _chat_completion_image_only(request, raw_request, prompt, multimodal_params, x2i_params)
+    async def events():
+        nonlocal prompt
+        if image_only and not request.chat_template_kwargs.get("enable_thinking", False):
+            # Direct image generation has no sampled <img> text action: both
+            # image delimiters belong to the visual context in this case.
+            visual_tokens = image_tokens + 1
+            if max_images < 1 or initial_tokens + visual_tokens > limit:
+                raise ValueError("the requested image does not fit the total trajectory budget")
+            images = await manager.generate_image(prompt, image_params, multimodal.clone(),
+                                                  request=raw_request, input_image_num=input_image_num)
+            if not images or len(images) != 1:
+                raise RuntimeError("SenseNova image action must return exactly one image")
+            yield {"type": "image", "text": "", "images": _message_contents_from_raw_images(images, request.image_config.image_type)}
+            yield {"type": "end", "finish_reason": "stop", "usage": UsageInfo(
+                prompt_tokens=initial_tokens, completion_tokens=0, image_context_tokens=visual_tokens,
+                total_tokens=initial_tokens + visual_tokens, max_sequence_length=limit, image_limit_hit=True)}
+            return
+        text_tokens = 0
+        visual_tokens = 0
+        images_used = 0
+        context = initial_tokens
+        text_only_tail = not image_enabled or max_images == 0
+        finish_reason = "length"
+        while context < limit:
+            span = span_budget(limit, context, image_tokens=image_tokens,
+                               allow_image=not text_only_tail and images_used < max_images)
+            text_only_tail = not span.allow_image
+            if span.max_tokens == 0:
+                break
+            sampling.max_new_tokens = span.max_tokens
+            stops = list(request.stop or []) if not isinstance(request.stop, str) else [request.stop]
+            if span.allow_image:
+                stops.append(image_start)
+            sampling.stop_sequences.initialize(stops, manager.tokenizer)
+            sampling.invalid_token_ids.initialize([] if span.allow_image else [image_id])
+            chunk = ""
+            stopped_on_image = False
+            emitted = 0
+            span_finish = "length"
+            async for _, text, metadata, status in manager.generate(
+                prompt, sampling, multimodal.clone(), request=raw_request,
+                max_req_total_len=span.sequence_limit,
+            ):
+                emitted += 1
+                text_tokens += 1
+                stopped_on_image = int(metadata["id"]) == image_id
+                if not stopped_on_image:
+                    chunk += text
+                    yield {"type": "text", "text": text}
+                if status.is_finished():
+                    span_finish = status.get_finish_reason()
+                    actual_prompt = int(metadata["prompt_tokens"])
+                    if actual_prompt != context:
+                        raise RuntimeError("interleaved prompt re-encoding changed the trajectory token count")
+            if not emitted:
+                raise RuntimeError("SenseNova returned an empty text span")
+            context += emitted
+            prompt += chunk
+            if not stopped_on_image:
+                if span_finish == "length" and span.allow_image and context < limit:
+                    text_only_tail = True
+                    continue
+                finish_reason = span_finish
+                break
+            if not span.allow_image:
+                raise RuntimeError("SenseNova emitted a masked image action")
+            images = await manager.generate_image(
+                prompt, image_params, multimodal.clone(), request=raw_request,
+                input_image_num=input_image_num,
+            )
+            if not images or len(images) != 1:
+                raise RuntimeError("SenseNova image action must return exactly one image")
+            actual_image_tokens = image_context_tokens(
+                manager.tokenizer, width=int(image_params.width), height=int(image_params.height)
+            )
+            if actual_image_tokens != image_tokens or context + image_tokens > limit:
+                raise RuntimeError("image geometry exceeded its reserved context")
+            prompt += image_tag
+            multimodal.add_image({"type": "base64", "data": _normalize_image_b64_for_multimodal(images[0])})
+            images_used += 1
+            visual_tokens += image_tokens
+            context += image_tokens
+            yield {"type": "image", "images": _message_contents_from_raw_images(images, request.image_config.image_type),
+                   "text": image_tag if not image_only else ""}
+            if image_only:
+                finish_reason = "stop"
+                break
+        if context > limit or context != initial_tokens + text_tokens + visual_tokens:
+            raise RuntimeError("SenseNova violated total trajectory accounting")
+        yield {"type": "end", "finish_reason": finish_reason, "usage": UsageInfo(
+            prompt_tokens=initial_tokens, completion_tokens=text_tokens,
+            image_context_tokens=visual_tokens, total_tokens=context,
+            max_sequence_length=limit, image_limit_hit=image_enabled and images_used == max_images,
+        )}
 
     if not request.stream:
-        from .req_id_generator import convert_sub_id_to_group_id
-
         full_text = ""
-        response_images: List[MessageContent] = []
-        prompt_tokens = 0
-        completion_tokens = 0
-        total_completion_tokens = int(sampling_params.max_new_tokens)
-        finish_reason: Optional[str] = "stop"
-        group_request_id = None
-        max_image_gen_num = 15 if not image_only else 1  # TODO: make this configurable
-
-        while max_image_gen_num > 0:
-            if not _set_interleaved_completion_budget(
-                sampling_params,
-                total_completion_tokens=total_completion_tokens,
-                used_completion_tokens=completion_tokens,
-            ):
-                finish_reason = "length"
-                break
-            max_image_gen_num -= 1
-            need_call_x2i = False
-            output_chunk = ""
-            text_generator = g_objs.httpserver_manager.generate(
-                prompt, sampling_params, multimodal_params.clone(), request=raw_request
-            )
-            async for sub_req_id, request_output, metadata, finish_status in text_generator:
-                prompt_tokens = metadata["prompt_tokens"]
-                completion_tokens += 1
-                if group_request_id is None:
-                    group_request_id = convert_sub_id_to_group_id(sub_req_id)
-                delta = request_output
-                if finish_status.is_finished():
-                    finish_reason = finish_status.get_finish_reason()
-                if delta == image_start_tag:
-                    need_call_x2i = True
-                    continue
-                output_chunk += delta
-
-            full_text += output_chunk
-
-            if need_call_x2i or image_only:
-                prompt += output_chunk
-                images = await g_objs.httpserver_manager.generate_image(
-                    prompt, x2i_params, multimodal_params.clone(), request=raw_request, input_image_num=input_image_num
-                )
-                if len(images) == 0:
-                    logger.warning(f"No image generated by x2i: {prompt[-100:]}, exit...")
-                    break
-                response_images.extend(_message_contents_from_raw_images(images, request.image_config.image_type))
-                for image in images:
-                    prompt += image_tag
-                    full_text += image_tag if not image_only else ""
-                    multimodal_params.add_image({"type": "base64", "data": _normalize_image_b64_for_multimodal(image)})
+        response_images = []
+        final = None
+        async for event in events():
+            if event["type"] == "end":
+                final = event
             else:
-                break
-
+                full_text += event["text"]
+                if event["type"] == "image":
+                    response_images.extend(event["images"])
         reasoning_text = None
         text_out = full_text
         reasoning_parser = get_env_start_args().reasoning_parser
         if reasoning_parser and request.separate_reasoning:
-            request_enable_reasoning = _get_reasoning_from_request(request)
-            try:
-                parser = ReasoningParser(
-                    model_type=reasoning_parser,
-                    stream_reasoning=False,
-                    force_reasoning=request_enable_reasoning,
-                )
-                reasoning_text, text_out = parser.parse_non_stream(full_text)
-            except Exception as e:
-                logger.error(f"Reasoning parsing error: {e}")
-                return create_error_response(
-                    HTTPStatus.BAD_REQUEST,
-                    "Failed to parse reasoning content!",
-                )
-
-        usage = UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        )
-        chat_message = ChatMessage(
-            role="assistant",
-            content=text_out,
-            reasoning_content=reasoning_text if reasoning_text else "",
-            images=response_images if response_images else None,
-        )
-        choice = ChatCompletionResponseChoice(
-            index=0,
-            message=chat_message,
-            finish_reason=finish_reason,
-        )
+            parser = ReasoningParser(model_type=reasoning_parser, stream_reasoning=False,
+                                     force_reasoning=_get_reasoning_from_request(request))
+            reasoning_text, text_out = parser.parse_non_stream(full_text)
         return ChatCompletionResponse(
-            id=group_request_id or f"chatcmpl-{uuid.uuid4().hex}",
-            created=created_time,
-            model=request.model,
-            choices=[choice],
-            usage=usage,
+            id=request_id, created=created, model=request.model, usage=final["usage"],
+            choices=[ChatCompletionResponseChoice(index=0, finish_reason=final["finish_reason"],
+                message=ChatMessage(role="assistant", content=text_out,
+                    reasoning_content=reasoning_text or "", images=response_images or None))],
         )
 
-    async def stream_result() -> AsyncGenerator[bytes, None]:
-        nonlocal prompt
-        from .req_id_generator import convert_sub_id_to_group_id
-
-        prompt_tokens = 0
-        completion_tokens = 0
-        total_completion_tokens = int(sampling_params.max_new_tokens)
-        finish_reason = None
-        group_request_id = None
-        max_image_gen_num = 15 if not image_only else 1  # TODO: make this configurable
-
-        while max_image_gen_num > 0:
-            if not _set_interleaved_completion_budget(
-                sampling_params,
-                total_completion_tokens=total_completion_tokens,
-                used_completion_tokens=completion_tokens,
-            ):
-                finish_reason = "length"
-                break
-            max_image_gen_num -= 1
-            need_call_x2i = False
-            text_generator = g_objs.httpserver_manager.generate(
-                prompt, sampling_params, multimodal_params.clone(), request=raw_request
-            )
-
-            reasoning_parser_dict = {}
-            output_chunk = ""
-
-            async for sub_req_id, request_output, metadata, finish_status in text_generator:
-                prompt_tokens = metadata["prompt_tokens"]
-                completion_tokens += 1
-                if group_request_id is None:
-                    group_request_id = convert_sub_id_to_group_id(sub_req_id)
-
-                index = sub_req_id
-                delta = request_output
-                finish_reason = finish_status.get_finish_reason()
-                if delta == image_start_tag:
-                    need_call_x2i = True
-                    continue
-
-                output_chunk += delta
-
-                # Handle reasoning content
-                if get_env_start_args().reasoning_parser and request.separate_reasoning:
-                    reasoning_text, delta = _process_reasoning_stream(
-                        index, delta, reasoning_parser_dict, request_output, request
-                    )
-                    if reasoning_text:
-                        choice_data = ChatCompletionStreamResponseChoice(
-                            index=0,
-                            delta=DeltaMessage(reasoning_content=reasoning_text),
-                            finish_reason=None,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=group_request_id,
-                            created=created_time,
-                            choices=[choice_data],
-                            model=request.model,
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-
-                delta_message = DeltaMessage(role="assistant", content=delta)
-                if finish_status.is_finished():
-                    finish_reason = finish_status.get_finish_reason()
-                stream_choice = ChatCompletionStreamResponseChoice(
-                    index=0, delta=delta_message, finish_reason=finish_reason
-                )
-                stream_resp = ChatCompletionStreamResponse(
-                    id=group_request_id,
-                    created=created_time,
-                    model=request.model,
-                    choices=[stream_choice],
-                )
-                yield ("data: " + json.dumps(stream_resp.model_dump(), ensure_ascii=False) + "\n\n").encode("utf-8")
-
-            if need_call_x2i or image_only:
-                prompt += output_chunk
-
-                images = await g_objs.httpserver_manager.generate_image(
-                    prompt, x2i_params, multimodal_params.clone(), request=raw_request, input_image_num=input_image_num
-                )
-
-                if images is None or len(images) == 0:
-                    logger.warning(f"No image generated by x2i: {prompt[-100:]}, exit...")
-                    break
-
-                tag_chunk = ChatCompletionStreamResponse(
-                    id=group_request_id,
-                    created=created_time,
-                    model=request.model,
-                    choices=[
-                        ChatCompletionStreamResponseChoice(
-                            index=0,
-                            delta=DeltaMessage(role="assistant", content=image_tag),
-                            finish_reason=None,
-                        )
-                    ],
-                )
-                yield f"data: {tag_chunk.model_dump_json()}\n\n"
-
-                img_items = _message_contents_from_raw_images(images, request.image_config.image_type)
-                img_chunk = ChatCompletionStreamResponse(
-                    id=group_request_id,
-                    created=created_time,
-                    model=request.model,
-                    choices=[
-                        ChatCompletionStreamResponseChoice(
-                            index=0,
-                            delta=DeltaMessage(role="assistant", images=img_items),
-                            finish_reason=None,
-                        )
-                    ],
-                )
-                yield f"data: {img_chunk.model_dump_json()}\n\n"
-
-                for image in images:
-                    prompt += image_tag
-                    multimodal_params.add_image({"type": "base64", "data": _normalize_image_b64_for_multimodal(image)})
-
+    async def stream_result():
+        parser_state = {}
+        async for event in events():
+            if event["type"] == "end":
+                payload = {"id": request_id, "object": "chat.completion.chunk", "created": created,
+                           "model": request.model, "choices": [{"index": 0, "delta": {},
+                           "finish_reason": event["finish_reason"]}], "usage": event["usage"].model_dump()}
             else:
-                break
+                delta = {"content": event["text"]}
+                if event["type"] == "image":
+                    delta["images"] = [item.model_dump() for item in event["images"]]
+                elif get_env_start_args().reasoning_parser and request.separate_reasoning:
+                    reasoning, content = _process_reasoning_stream(0, event["text"], parser_state, event["text"])
+                    delta = {"content": content}
+                    if reasoning:
+                        delta["reasoning_content"] = reasoning
+                payload = {"id": request_id, "object": "chat.completion.chunk", "created": created,
+                           "model": request.model, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+            yield ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode()
+        yield b"data: [DONE]\n\n"
 
-        if request.stream_options and request.stream_options.include_usage:
-            usage = UsageInfo(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-            )
-            usage_chunk = ChatCompletionStreamResponse(
-                id=group_request_id,
-                created=created_time,
-                choices=[],
-                model=request.model,
-                usage=usage,
-            )
-            yield f"data: {usage_chunk.model_dump_json()}\n\n"
-
-    return StreamingResponse(stream_result(), media_type="text/event-stream", background=BackgroundTasks())
+    return StreamingResponse(stream_result(), media_type="text/event-stream")
 
 
 async def completions_impl(request: CompletionRequest, raw_request: Request) -> Response:

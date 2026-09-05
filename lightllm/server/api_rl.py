@@ -22,6 +22,7 @@ from .build_prompt import build_prompt
 from .httpserver.manager import HttpServerManager
 from .multimodal_params import MultimodalParams
 from .rl_models import RLRolloutRequest
+from .trajectory_budget import require_server_limit, image_context_tokens as _image_context_tokens, span_budget, prompt_token_count
 
 
 def _image_config(policy, seed: int) -> ImageConfig:
@@ -32,6 +33,7 @@ def _image_config(policy, seed: int) -> ImageConfig:
         "seed": seed,
         "num_images": 1,
         "cfg_norm": "none",
+        "dynamic_resolution": False,
     }
     if policy.height is not None or policy.width is not None:
         values.update(height=policy.height, width=policy.width)
@@ -52,35 +54,13 @@ def _sde_config(policy) -> dict[str, Any]:
     return values
 
 
-def _image_context_tokens(manager: HttpServerManager, *, width: int, height: int) -> int:
-    """Return LM positions appended after an already-sampled ``<img>`` action."""
-
-    patch_size = int(manager.tokenizer.patch_size)
-    downsample_ratio = float(manager.tokenizer.downsample_ratio)
-    merge_size = int(1 / downsample_ratio)
-    token_width = width // (patch_size * merge_size)
-    token_height = height // (patch_size * merge_size)
-    if token_width < 1 or token_height < 1:
-        raise ValueError("generated image geometry has no language-model context tokens")
-    # The sampled text action already contributes <img>; the image branch
-    # appends its context grid and the closing </img> position.
-    return token_width * token_height + 1
-
-
 async def _one_rollout(
     request: RLRolloutRequest,
     seed: int,
     raw_request: Request,
     manager: HttpServerManager,
 ) -> dict[str, Any]:
-    if request.max_sequence_length > manager.max_req_total_len:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "RL max_sequence_length exceeds the serving engine's "
-                f"max_req_total_len={manager.max_req_total_len}"
-            ),
-        )
+    require_server_limit(request.max_sequence_length, manager.max_req_total_len)
     modalities = ["text"] if request.modality == "ti2t" else ["text", "image"]
     image_config = None if request.modality == "ti2t" else _image_config(request.image_policy, seed)
     chat_v2 = ChatCompletionRequestV2(
@@ -92,7 +72,10 @@ async def _one_rollout(
         top_k=-1,
         do_sample=True,
         seed=seed,
-        max_tokens=request.max_new_tokens,
+        max_tokens=request.max_sequence_length,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        repetition_penalty=1.0,
         stream=False,
         chat_template_kwargs={},
     )
@@ -110,35 +93,42 @@ async def _one_rollout(
         image_geometry = X2IParams()
         image_geometry.init_from_image_config(image_config)
         expected_image_context_tokens = _image_context_tokens(
-            manager,
+            manager.tokenizer,
             width=int(image_geometry.width),
             height=int(image_geometry.height),
         )
     events: list[dict[str, Any]] = []
-    remaining = request.max_new_tokens
     generated_images = 0
-    initial_prompt_tokens: int | None = None
-    context_tokens: int | None = None
+    await multimodal.verify_and_preload(raw_request)
+    probe_params = SamplingParams()
+    probe_params.init(tokenizer=manager.tokenizer, max_new_tokens=1, add_special_tokens=False)
+    initial_prompt_tokens = prompt_token_count(manager, prompt, multimodal, probe_params)
+    if initial_prompt_tokens >= request.max_sequence_length:
+        raise ValueError("RL input leaves no generation room under the total trajectory limit")
+    context_tokens = initial_prompt_tokens
     image_context_tokens = 0
     text_only_tail = request.modality == "ti2t" or request.max_images == 0
     finish_reason = "length"
 
-    while remaining > 0:
-        can_generate_image = request.modality == "ti2ti" and not text_only_tail
-        image_reserve = expected_image_context_tokens + 1 if can_generate_image else 0
-        span_sequence_limit = request.max_sequence_length - image_reserve
-        if context_tokens is not None and context_tokens >= span_sequence_limit:
-            text_only_tail = True
-            can_generate_image = False
-            image_reserve = 0
-            span_sequence_limit = request.max_sequence_length
+    while context_tokens < request.max_sequence_length:
+        span = span_budget(request.max_sequence_length, context_tokens,
+                           image_tokens=expected_image_context_tokens,
+                           allow_image=request.modality == "ti2ti" and not text_only_tail)
+        can_generate_image = span.allow_image
+        text_only_tail = not can_generate_image
+        span_sequence_limit = span.sequence_limit
+        image_reserve = request.max_sequence_length - span_sequence_limit
         params = SamplingParams()
         kwargs: dict[str, Any] = {
             "do_sample": True,
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": -1,
-            "max_new_tokens": remaining,
+            "max_new_tokens": span.max_tokens,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "input_penalty": False,
             "add_special_tokens": False,
             "seed": seed,
             "skip_special_tokens": False,
@@ -179,9 +169,8 @@ async def _one_rollout(
             raise RuntimeError("LightLLM returned an empty rollout span")
         if span_prompt_tokens < 1:
             raise RuntimeError("LightLLM omitted RL prompt-token usage")
-        if initial_prompt_tokens is None:
-            initial_prompt_tokens = span_prompt_tokens
-        remaining -= len(token_ids)
+        if span_prompt_tokens != context_tokens:
+            raise RuntimeError("RL prompt re-encoding changed the trajectory token count")
         context_tokens = span_prompt_tokens + len(token_ids)
         output_text = "".join(text_parts)
         stopped_on_image = token_ids[-1] == image_start_id
@@ -202,14 +191,14 @@ async def _one_rollout(
         )
 
         if not stopped_on_image:
-            if span_finish_reason == "length" and image_reserve and remaining > 0:
+            if span_finish_reason == "length" and image_reserve and context_tokens < request.max_sequence_length:
                 # The image-aware span intentionally stopped early so a late
                 # <img> action would still fit.  If no image was sampled, use
                 # that reserved tail for text while masking further images.
                 prompt += output_text
                 text_only_tail = True
                 continue
-            finish_reason = span_finish_reason or ("length" if remaining == 0 else "stop")
+            finish_reason = span_finish_reason or ("length" if context_tokens == request.max_sequence_length else "stop")
             break
         if not can_generate_image:
             raise RuntimeError("LightLLM emitted a masked image action")
@@ -230,7 +219,7 @@ async def _one_rollout(
         if not isinstance(x2i_response, X2IResponse) or not x2i_response.images:
             raise RuntimeError("LightX2V returned no image for an image action")
         actual_image_context_tokens = _image_context_tokens(
-            manager,
+            manager.tokenizer,
             width=int(x2i_params.width),
             height=int(x2i_params.height),
         )
@@ -272,7 +261,7 @@ async def _one_rollout(
             context_tokens += actual_image_context_tokens
         if generated_images >= request.max_images:
             text_only_tail = True
-        if remaining == 0:
+        if context_tokens == request.max_sequence_length:
             finish_reason = "length"
             break
 
@@ -291,6 +280,7 @@ async def _one_rollout(
             "image_count": generated_images,
             "image_context_tokens": image_context_tokens,
             "sequence_tokens": sequence_tokens,
+            "max_sequence_length": request.max_sequence_length,
         },
         "events": events,
     }

@@ -368,6 +368,8 @@ async def rl_rollouts(request: RLRolloutRequest, raw_request: Request):
     await g_objs.httpserver_manager.begin_generation_session(raw_request)
     try:
         return await impl(request, raw_request, g_objs.httpserver_manager)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         await g_objs.httpserver_manager.end_generation_session(raw_request)
 
@@ -508,6 +510,9 @@ async def completions_v2(request: ChatCompletionRequestV2, raw_request: Request)
     await g_objs.httpserver_manager.begin_generation_session(raw_request)
     try:
         resp = await chat_completions_impl_v2(request, raw_request)
+    except ValueError as exc:
+        await g_objs.httpserver_manager.end_generation_session(raw_request)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except BaseException:
         await g_objs.httpserver_manager.end_generation_session(raw_request)
         raise

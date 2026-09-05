@@ -90,13 +90,13 @@ class ImagePolicyConfig(BaseModel):
 
 
 class RLRolloutRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     expected_policy_version: str
     modality: Literal["ti2t", "ti2ti"]
     messages: list[Message]
     seeds: list[int] = Field(min_length=1)
     max_sequence_length: int = Field(default=8192, gt=1)
-    max_new_tokens: int = Field(default=6144, gt=0)
-    max_images: int = Field(default=1, ge=0)
+    max_images: int = Field(default=10, ge=0, le=10)
     temperature: float = 1.0
     top_p: float = 1.0
     image_policy: ImagePolicyConfig | None = None
@@ -105,8 +105,6 @@ class RLRolloutRequest(BaseModel):
     def validate_replay_contract(self):
         if self.temperature != 1.0 or self.top_p != 1.0:
             raise ValueError("RL replay currently requires temperature=1 and top_p=1")
-        if self.max_new_tokens >= self.max_sequence_length:
-            raise ValueError("max_new_tokens must leave room for the prompt")
         if self.modality == "ti2t" and self.max_images != 0:
             self.max_images = 0
         if self.modality == "ti2ti" and self.image_policy is None:

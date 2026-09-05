@@ -282,6 +282,9 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: Optional[int] = 0
     total_tokens: int = 0
+    image_context_tokens: int = 0
+    max_sequence_length: int | None = None
+    image_limit_hit: bool = False
 
 
 class ChatMessage(BaseModel):
@@ -509,6 +512,8 @@ class ImageConfig(BaseModel):
 class ChatCompletionRequestV2(ChatCompletionRequest):
     modalities: List[Modality] = ["text"]
     image_config: Optional[ImageConfig] = None
+    max_sequence_length: int | None = Field(default=None, gt=1)
+    max_images: int = Field(default=10, ge=0, le=10)
 
     @field_validator("modalities")
     @classmethod
