@@ -709,6 +709,9 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
     prompt, sampling, multimodal = await _get_text_generator_input(chat_request)
     await multimodal.verify_and_preload(raw_request)
     initial_tokens = prompt_token_count(manager, prompt, multimodal, sampling)
+    initial_image_tokens = sum(manager.tokenizer.get_image_token_length(image) for image in multimodal.images)
+    prompt_usage = dict(prompt_text_tokens=initial_tokens - initial_image_tokens,
+                        prompt_image_tokens=initial_image_tokens)
     if initial_tokens >= limit:
         raise ValueError(f"input uses {initial_tokens} tokens and leaves no room under total limit {limit}")
     input_image_num = len(multimodal.images)
@@ -745,9 +748,11 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
             yield {"type": "image", "text": "", "images": _message_contents_from_raw_images(images, request.image_config.image_type)}
             yield {"type": "end", "finish_reason": "stop", "usage": UsageInfo(
                 prompt_tokens=initial_tokens, completion_tokens=0, image_context_tokens=visual_tokens,
-                total_tokens=initial_tokens + visual_tokens, max_sequence_length=limit, image_limit_hit=True)}
+                total_tokens=initial_tokens + visual_tokens, max_sequence_length=limit, image_limit_hit=True,
+                completion_token_ids=[], **prompt_usage)}
             return
         text_tokens = 0
+        sampled_token_ids = []
         visual_tokens = 0
         images_used = 0
         context = initial_tokens
@@ -775,6 +780,7 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
             ):
                 emitted += 1
                 text_tokens += 1
+                sampled_token_ids.append(int(metadata["id"]))
                 stopped_on_image = int(metadata["id"]) == image_id
                 if not stopped_on_image:
                     chunk += text
@@ -823,6 +829,7 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
             prompt_tokens=initial_tokens, completion_tokens=text_tokens,
             image_context_tokens=visual_tokens, total_tokens=context,
             max_sequence_length=limit, image_limit_hit=image_enabled and images_used == max_images,
+            completion_token_ids=sampled_token_ids, **prompt_usage,
         )}
 
     if not request.stream:

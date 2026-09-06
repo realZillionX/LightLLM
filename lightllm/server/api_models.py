@@ -285,6 +285,11 @@ class UsageInfo(BaseModel):
     image_context_tokens: int = 0
     max_sequence_length: int | None = None
     image_limit_hit: bool = False
+    # Prompt image grids exclude the discrete <img>/</img> delimiters.
+    prompt_text_tokens: int | None = None
+    prompt_image_tokens: int | None = None
+    # Sampled IDs include EOS and image-start actions, before text decoding.
+    completion_token_ids: List[int] | None = None
 
 
 class ChatMessage(BaseModel):

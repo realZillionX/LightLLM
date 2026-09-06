@@ -153,6 +153,9 @@ class TrajectoryBudgetTest(unittest.TestCase):
         self.assertEqual(response.usage.prompt_tokens, 4)
         self.assertEqual(response.usage.completion_tokens, 16)
         self.assertEqual(response.usage.total_tokens, 20)
+        self.assertEqual(response.usage.prompt_text_tokens, 4)
+        self.assertEqual(response.usage.prompt_image_tokens, 0)
+        self.assertEqual(response.usage.completion_token_ids, [3] * 16)
         self.assertEqual(response.choices[0].finish_reason, "length")
 
     def test_ten_images_then_text_can_end_normally(self):
@@ -162,6 +165,7 @@ class TrajectoryBudgetTest(unittest.TestCase):
         self.assertIn(1, model.spans[-1][-1])
         self.assertEqual(response.usage.total_tokens, 4 + 11 + 10 * 2)
         self.assertTrue(response.usage.image_limit_hit)
+        self.assertEqual(response.usage.completion_token_ids, [1] * 10 + [2])
         self.assertEqual(response.choices[0].finish_reason, "stop")
 
     def test_image_reserve_prevents_overrun_and_releases_text_tail(self):
