@@ -68,6 +68,11 @@ def normal_or_p_d_start(args):
 
     args: StartArgs = args
 
+    if args.sensenova_modality == "ti2t" and args.enable_multimodal_x2i:
+        raise ValueError("TI2T serving must not allocate an image-generation backend")
+    if args.sensenova_modality == "ti2ti" and not args.enable_multimodal_x2i:
+        raise ValueError("TI2TI serving requires its image-generation backend")
+
     set_unique_server_name(args)
 
     if args.enable_mps:

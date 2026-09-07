@@ -169,6 +169,17 @@ class TrajectoryBudgetTest(unittest.TestCase):
         self.assertEqual(response.usage.completion_token_ids, [3] * 16)
         self.assertEqual(response.choices[0].finish_reason, "length")
 
+    def test_text_only_deployment_keeps_input_vision_and_total_budget(self):
+        model = Model(20, eos=False)
+        model.args.enable_multimodal_x2i = False
+        model.args.sensenova_modality = "ti2t"
+        response = run_request(model, text_only=True, max_images=0)
+        self.assertEqual(response.usage.total_tokens, 20)
+        self.assertEqual(response.usage.completion_token_ids, [3] * 16)
+        self.assertEqual(model.draws, 0)
+        with self.assertRaisesRegex(ValueError, "text output only"):
+            run_request(model)
+
     def test_ten_images_then_text_can_end_normally(self):
         model = Model(100, images=True)
         response = run_request(model)

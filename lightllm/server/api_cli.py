@@ -336,6 +336,8 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="if the model is a multimodal model, set to not load audio part model.",
     )
+    parser.add_argument("--sensenova_modality", choices=["ti2t", "ti2ti"], default=None,
+                        help="SenseNova serving action space; TI2T keeps input vision without image generation.")
     parser.add_argument(
         "--enable_multimodal_x2i",
         action="store_true",

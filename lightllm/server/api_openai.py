@@ -691,8 +691,11 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
                                     span_budget, prompt_token_count, TokenizedMultimodalPrompt)
 
     manager = g_objs.httpserver_manager
-    if not manager.args.enable_multimodal_x2i:
+    serving_modality = getattr(manager.args, "sensenova_modality", None)
+    if not manager.args.enable_multimodal_x2i and serving_modality != "ti2t":
         return await chat_completions_impl(ChatCompletionRequest(**request.model_dump()), raw_request)
+    if serving_modality == "ti2t" and (request.modalities != ["text"] or request.max_images != 0):
+        raise ValueError("TI2T serving accepts text output only and max_images=0")
     limit = require_server_limit(request.max_sequence_length, manager.max_req_total_len)
     if request.logit_bias is not None or request.function_call != "none":
         raise ValueError("SenseNova trajectory inference does not support logit bias or function calls")
