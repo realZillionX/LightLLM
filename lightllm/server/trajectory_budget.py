@@ -3,6 +3,17 @@
 from dataclasses import dataclass
 
 
+@dataclass(frozen=True)
+class TokenizedMultimodalPrompt:
+    """Exact text actions with unexpanded <img></img> media placeholders.
+
+    Image-cache IDs are allocated afresh for each decoder span. Text IDs must
+    survive detokenization: encoding the rendered text again can merge tokens.
+    """
+
+    token_ids: tuple[int, ...]
+
+
 def prompt_token_count(manager, prompt: str, multimodal, sampling) -> int:
     """Count the exact NeoChat expansion without allocating image-cache entries."""
     tokenizer = manager.tokenizer

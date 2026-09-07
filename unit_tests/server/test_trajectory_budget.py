@@ -28,10 +28,14 @@ class Box(types.SimpleNamespace):
 class Tokens:
     patch_size, downsample_ratio = 16, 0.5
     image_start_id = 1
+    image_end_id = 4
     image_tag, image_start_tag, image_end_tag = "<image>", "<img>", "</img>"
 
     def encode(self, text, *_args, **_kwargs):
-        return re.findall(r"<img>|</img>|.", text)
+        # Adjacent decoded x characters merge, although the policy may have
+        # sampled separate x tokens, as real BPE tokenization permits.
+        return [1 if token == "<img>" else 4 if token == "</img>" else 100 + len(token)
+                for token in re.findall(r"<img>|</img>|xx|.", text)]
 
     def init_imageitem_extral_params(self, *_args):
         pass
@@ -93,9 +97,15 @@ class Model:
         self.eos = eos
         self.draws = 0
         self.spans = []
+        self.token_prompts = []
+        self.image_prompts = []
 
     async def generate(self, prompt, sampling, mm, *, max_req_total_len, **kwargs):
-        context = budget.prompt_token_count(self, prompt, mm, sampling)
+        if isinstance(prompt, budget.TokenizedMultimodalPrompt):
+            self.token_prompts.append(prompt.token_ids)
+            context = len(prompt.token_ids) + len(mm.images)
+        else:
+            context = budget.prompt_token_count(self, prompt, mm, sampling)
         self.spans.append((context, sampling.max_new_tokens, max_req_total_len, list(sampling.invalid)))
         assert context + sampling.max_new_tokens == max_req_total_len
         if self.images and 1 not in sampling.invalid:
@@ -111,6 +121,7 @@ class Model:
                     get_finish_reason=lambda: "length")
 
     async def generate_image(self, *_args, **_kwargs):
+        self.image_prompts.append(_kwargs.get("conditional_prompt"))
         self.draws += 1
         return ["image-bytes"]
 
@@ -181,6 +192,41 @@ class TrajectoryBudgetTest(unittest.TestCase):
         response = run_request(model)
         self.assertEqual(response.usage.completion_tokens, 16)
         self.assertEqual(len(model.spans), 2)
+        self.assertEqual(model.token_prompts[1], (101,) * 4 + (3,) * 13)
+
+    def test_generated_image_context_keeps_exact_sampled_prefix(self):
+        model = Model(100, images=True)
+        run_request(model)
+        self.assertEqual(model.image_prompts[0].token_ids, (101,) * 4 + (1,))
+        self.assertEqual(model.token_prompts[1], (101,) * 4 + (1, 4))
+
+    def test_token_prompt_reallocates_media_before_expansion(self):
+        tree = ast.parse((SERVER / "httpserver/manager.py").read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HttpServerManager")
+        method = next(n for n in cls.body if getattr(n, "name", None) == "_encode")
+        module = ast.parse("from __future__ import annotations")
+        module.body.append(method)
+        scope = {"TokenizedMultimodalPrompt": budget.TokenizedMultimodalPrompt}
+        exec(compile(ast.fix_missing_locations(module), "_encode", "exec"), scope)
+        calls = []
+        mm, sampling = MM(), Sampler()
+
+        async def allocate(media, params):
+            self.assertIs(media, mm)
+            self.assertIs(params, sampling)
+            calls.append("allocated")
+
+        def encode(ids, media, **kw):
+            self.assertEqual(calls, ["allocated"])
+            self.assertEqual(ids, [1, 4, 3, 3])
+            self.assertIs(media, mm)
+            self.assertEqual(kw, {"already_tokenized": True, "add_special_tokens": False})
+            return [1, 50000, 4, 3, 3]
+
+        manager = Box(_alloc_multimodal_resources=allocate, tokenizer=Box(encode=encode))
+        result = asyncio.run(scope["_encode"](
+            manager, budget.TokenizedMultimodalPrompt((1, 4, 3, 3)), mm, sampling))
+        self.assertEqual(result, [1, 50000, 4, 3, 3])
 
     def test_rejects_an_independent_server_capacity(self):
         with self.assertRaisesRegex(ValueError, "must equal"):

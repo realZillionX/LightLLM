@@ -23,6 +23,7 @@ from ..tokenizer import get_tokenizer
 from ..pd_io_struct import NodeRole, ObjType, NIXLDecodeNodeInfo
 from ..embed_cache.utils import get_shm_name_data, create_shm
 from ..multimodal_params import AudioItem, MultimodalParams, ImageItem
+from ..trajectory_budget import TokenizedMultimodalPrompt
 from ..req_id_generator import ReqIDGenerator
 from .async_queue import AsyncQueue
 from lightllm.server.core.objs import Req, FinishStatus, StartArgs
@@ -320,7 +321,7 @@ class HttpServerManager:
 
     async def generate(
         self,
-        prompt: Union[str, List[int]],
+        prompt: Union[str, List[int], TokenizedMultimodalPrompt],
         sampling_params: SamplingParams,
         multimodal_params: MultimodalParams,
         request: Request,
@@ -533,6 +534,7 @@ class HttpServerManager:
         request: Request,
         input_image_num: int = 0,
         return_response: bool = False,
+        conditional_prompt: Optional[TokenizedMultimodalPrompt] = None,
     ):
         generate_req_ids = []
 
@@ -566,6 +568,8 @@ class HttpServerManager:
                 prompt_condition, prompt_text_uncondition, prompt_img_uncondition = self.tokenizer.get_query_for_it2i(
                     prompt
                 )
+                if conditional_prompt is not None:
+                    prompt_condition = conditional_prompt
                 sample_params2 = SamplingParams()
                 sample_params2.init(self.tokenizer, **{"img_gen_prefill": True})
                 (con_gen, text_uncon_gen, img_uncon_gen) = await asyncio.gather(
@@ -579,6 +583,8 @@ class HttpServerManager:
             else:
                 # call t2i
                 prompt_condition, prompt_uncondition = self.tokenizer.get_query_for_t2i(prompt, input_image_num)
+                if conditional_prompt is not None:
+                    prompt_condition = conditional_prompt
                 logger.info(f"generate image with: {prompt_condition}, and {prompt_uncondition}")
                 if hasattr(generation_params, "rl_config"):
                     # RL defines the visual policy without classifier-free
@@ -657,8 +663,16 @@ class HttpServerManager:
         return
 
     async def _encode(
-        self, prompt: Union[str, List[int]], multimodal_params: MultimodalParams, sampling_params: SamplingParams
+        self, prompt: Union[str, List[int], TokenizedMultimodalPrompt], multimodal_params: MultimodalParams, sampling_params: SamplingParams
     ):
+        if isinstance(prompt, TokenizedMultimodalPrompt):
+            # Reallocate media cache references, while preserving every sampled
+            # text ID and its position in the interleaved trajectory.
+            await self._alloc_multimodal_resources(multimodal_params, sampling_params)
+            return self.tokenizer.encode(
+                list(prompt.token_ids), multimodal_params,
+                already_tokenized=True, add_special_tokens=False,
+            )
         if isinstance(prompt, str):
             if self.enable_multimodal:
                 assert (

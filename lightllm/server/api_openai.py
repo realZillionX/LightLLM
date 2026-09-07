@@ -687,7 +687,8 @@ def _normalize_image_b64_for_multimodal(image: Union[str, bytes]) -> str:
 async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request: Request) -> Response:
     """SenseNova inference with one total input/output context limit."""
     from .api_http import g_objs
-    from .trajectory_budget import require_server_limit, image_context_tokens, span_budget, prompt_token_count
+    from .trajectory_budget import (require_server_limit, image_context_tokens,
+                                    span_budget, prompt_token_count, TokenizedMultimodalPrompt)
 
     manager = g_objs.httpserver_manager
     if not manager.args.enable_multimodal_x2i:
@@ -721,6 +722,10 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
     image_start = manager.tokenizer.image_start_tag
     image_id = manager.tokenizer.image_start_id
     image_tag = manager.tokenizer.image_tag
+    prompt_ids = manager.tokenizer.encode(
+        prompt.replace(image_tag, image_start + manager.tokenizer.image_end_tag, input_image_num),
+        None, add_special_tokens=False,
+    )
     image_params = X2IParams()
     image_tokens = 0
     if image_enabled:
@@ -775,12 +780,13 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
             emitted = 0
             span_finish = "length"
             async for _, text, metadata, status in manager.generate(
-                prompt, sampling, multimodal.clone(), request=raw_request,
+                TokenizedMultimodalPrompt(tuple(prompt_ids)), sampling, multimodal.clone(), request=raw_request,
                 max_req_total_len=span.sequence_limit,
             ):
                 emitted += 1
                 text_tokens += 1
                 sampled_token_ids.append(int(metadata["id"]))
+                prompt_ids.append(int(metadata["id"]))
                 stopped_on_image = int(metadata["id"]) == image_id
                 if not stopped_on_image:
                     chunk += text
@@ -789,7 +795,7 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
                     span_finish = status.get_finish_reason()
                     actual_prompt = int(metadata["prompt_tokens"])
                     if actual_prompt != context:
-                        raise RuntimeError("interleaved prompt re-encoding changed the trajectory token count")
+                        raise RuntimeError("interleaved token prompt disagrees with the trajectory token count")
             if not emitted:
                 raise RuntimeError("SenseNova returned an empty text span")
             context += emitted
@@ -805,6 +811,7 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
             images = await manager.generate_image(
                 prompt, image_params, multimodal.clone(), request=raw_request,
                 input_image_num=input_image_num,
+                conditional_prompt=TokenizedMultimodalPrompt(tuple(prompt_ids)),
             )
             if not images or len(images) != 1:
                 raise RuntimeError("SenseNova image action must return exactly one image")
@@ -814,6 +821,7 @@ async def chat_completions_impl_v2(request: ChatCompletionRequestV2, raw_request
             if actual_image_tokens != image_tokens or context + image_tokens > limit:
                 raise RuntimeError("image geometry exceeded its reserved context")
             prompt += image_tag
+            prompt_ids.append(manager.tokenizer.image_end_id)
             multimodal.add_image({"type": "base64", "data": _normalize_image_b64_for_multimodal(images[0])})
             images_used += 1
             visual_tokens += image_tokens
