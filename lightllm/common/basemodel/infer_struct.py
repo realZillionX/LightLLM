@@ -34,24 +34,29 @@ class InferStateInfo:
         self.b_req_idx: torch.Tensor = None
         self.b_ready_cache_len: torch.Tensor = None  # only for prefill prompt cache used.
 
-        self.b_shared_seq_len: torch.Tensor = None  # only for diverse mode used in decode phase.
-        self.b_mark_shared_group: torch.Tensor = None  # only for diverse mode used in decode phase.
+        self.b_shared_seq_len: torch.Tensor = None  # raw decode radix-cache shared lengths.
+        self.b_shared_radix_node_id: torch.Tensor = None  # raw decode radix-node ids.
+
+        self.b_mtp_index: torch.Tensor = None
+        # MRoPE position offset propagated from ModelInput.
+        self.b_position_delta: torch.Tensor = None
 
         self.b_seq_len: torch.Tensor = None
         # max_cache_len 用于 prefill 阶段标识请求中最大 cache的kv 的长度
         self.max_cache_len: int = None
-        # prefix_total_token_num 用于 prefill 阶段标识当前请求中所有已经ready的kv的长度
-        # 的sum值, 其值等于 sum(b_ready_cache_len)
-        self.prefix_total_token_num: int = None
         self.is_prefill: bool = None
+        self.is_draft_model: bool = False
 
         self.mem_manager: MemoryManager = None
         self.req_manager: ReqManager = None
 
         self.mem_index: torch.Tensor = None
 
-        self.is_token_healing: bool = False
         self.return_all_prompt_logics: bool = False
+        # 在开启 return_all_prompt_logics 模式时，保存整个 prefill 阶段每一个
+        # token 位置的 logits，供后续回传 prompt logprobs 信息使用。
+        # 仅在 prefill 阶段且需要返回 prompt logprobs 时才会被填充。
+        self.prompt_logics: Optional[torch.Tensor] = None
         self.multimodal_params: dict = None
         self.is_cuda_graph: bool = False  # 标记是否是cuda graph的捕获推理
         self.dist_group: CustomProcessGroup = None
@@ -59,6 +64,10 @@ class InferStateInfo:
         # 在microbatch overlap的运行模式下，用于标记当前 microbatch 的 index 序号
         # 在一些细节场景下需要有该信息区分一些资源的申请和管理。
         self.microbatch_index: int = 0
+
+        # 当前 forward 独占的 hidden state 收集器。普通推理使用短生命周期实例；
+        # Prefill CUDA Graph 使用随 graph infer state 长期保存的实例。
+        self.hidden_collector = None
 
         # 衍生使用的管理变量，为了方便扩展接入其他的高性能attention推理算子，在
         # inferstate 基类上添加下面的标记变量，用于扩展。
@@ -342,7 +351,7 @@ class InferStateInfo:
         )
         return origin_data.view(-1, *old_shape[1:])
 
-    # 用于 prefll cuda graph 的专用功能接口
+    # 用于 prefill cuda graph 的专用功能接口
     def prefill_cuda_graph_create_graph_obj(self):
         if not hasattr(self, "prefill_cuda_graph_exe_list"):
             self.prefill_cuda_graph_exe_list = []

@@ -1,3 +1,4 @@
+from lightllm.utils.shm_port_args import get_shm_port_args
 import datetime
 import inspect
 import torch
@@ -29,11 +30,11 @@ class LightX2VServer:
         if self.rank == 0:
             context = zmq.asyncio.Context(2)
             self.task_socket = context.socket(zmq.PULL)
-            self.task_socket.connect(f"{args.zmq_mode}127.0.0.1:{self.args.x2i_worker_task_port}")
+            self.task_socket.connect(f"{args.zmq_mode}127.0.0.1:{get_shm_port_args().x2i_worker_task_port}")
 
             # send result back
             self.result_socket = context.socket(zmq.PUSH)
-            self.result_socket.connect(f"{args.zmq_mode}127.0.0.1:{self.args.http_server_port_for_x2i}")
+            self.result_socket.connect(f"{args.zmq_mode}127.0.0.1:{get_shm_port_args().http_server_port_for_x2i}")
 
         self.past_kv_cache_client = PastKVCacheClient(only_create_meta_data=False, init_shm_data=False)
         torch.cuda.set_device(rank)
@@ -43,7 +44,7 @@ class LightX2VServer:
 
     def _init_pipeline(self):
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(self.args.x2i_worker_nccl_port)
+        os.environ["MASTER_PORT"] = str(get_shm_port_args().x2i_worker_nccl_port)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.world_size)
 

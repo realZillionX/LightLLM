@@ -18,6 +18,7 @@ from .cpu_cache_client import CpuKvCacheClient
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.process_check import start_parent_check_thread
 from lightllm.utils.envs_utils import get_unique_server_name
+from lightllm.utils.shm_port_args import get_shm_port_args
 
 logger = init_logger(__name__)
 
@@ -28,12 +29,13 @@ class MultiLevelKVCacheManager:
         args: StartArgs,
     ):
         self.args: StartArgs = args
+        ports = get_shm_port_args()
         context = zmq.Context(2)
         self.zmq_recv_socket = context.socket(zmq.PULL)
-        self.zmq_recv_socket.bind(f"{args.zmq_mode}127.0.0.1:{args.multi_level_kv_cache_port}")
+        self.zmq_recv_socket.bind(f"{args.zmq_mode}127.0.0.1:{ports.multi_level_kv_cache_port}")
 
         self.send_to_router = context.socket(zmq.PUSH)
-        self.send_to_router.connect(f"{args.zmq_mode}127.0.0.1:{args.router_port}")
+        self.send_to_router.connect(f"{args.zmq_mode}127.0.0.1:{ports.router_port}")
         logger.info(f"send_to_router sendhwm {self.send_to_router.getsockopt(zmq.SNDHWM)}")
         self.cpu_cache_client = CpuKvCacheClient(only_create_meta_data=False, init_shm_data=True)
         self.shm_req_manager = ShmReqManager()
@@ -162,6 +164,9 @@ class MultiLevelKVCacheManager:
                 continue
 
             req: Req = req
+            if req.sample_params.prompt_logprobs >= 0:
+                continue
+
             token_hash_list = req.token_hash_list.get_all()
             if len(token_hash_list) == 0:
                 continue
@@ -176,7 +181,27 @@ class MultiLevelKVCacheManager:
             else:
                 # 匹配 disk cache并load到cpu cache
                 finded_page_indexes, disk_page_num = self._disk_cache_match(token_hash_list, all_pages)
-                req.disk_prompt_cache_len = disk_page_num * self.args.cpu_cache_token_page_size
+
+                try:
+                    token_hash_page_len_list = req.token_hash_page_len_list.get_all()
+
+                    if disk_page_num == 0 or len(finded_page_indexes) == 0:
+                        req.disk_prompt_cache_len = 0
+                    else:
+                        all_page_num = len(finded_page_indexes)
+                        cpu_match_page_num = all_page_num - disk_page_num
+
+                        if cpu_match_page_num == 0:
+                            cpu_match_page_len = 0
+                        else:
+                            cpu_match_page_len = token_hash_page_len_list[cpu_match_page_num - 1]
+
+                        req.disk_prompt_cache_len = token_hash_page_len_list[all_page_num - 1] - cpu_match_page_len
+                except Exception as e:
+                    # 因为不清楚上面的代码是否存在边界 bug，调用者是多线程的，自己打日志记录，避免
+                    # 日志无法记录， 无法排查问题。
+                    logger.exception(f"calculate disk prompt cache len has exception {str(e)}")
+                    raise e
 
             while not self.cpu_cache_client.check_allpages_ready(finded_page_indexes):
                 time.sleep(0.01)
@@ -236,6 +261,7 @@ def start_multi_level_kv_cache_manager(args, pipe_writer):
             args=args,
         )
     except Exception as e:
+        logger.exception(f"start multi_level_kv_cache_manager has exception {str(e)}")
         pipe_writer.send(str(e))
         raise
 

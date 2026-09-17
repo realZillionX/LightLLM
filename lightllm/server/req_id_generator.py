@@ -19,27 +19,27 @@ class ReqIDGenerator:
     def __init__(self):
         from lightllm.server.core.objs.atomic_lock import AtomicShmLock
         from lightllm.server.core.objs.shm_array import ShmArray
-        from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args
+        from lightllm.utils.envs_utils import get_env_start_args
 
         self.args = get_env_start_args()
         self.use_config_server = (
             self.args.config_server_host and self.args.config_server_port and self.args.run_mode == "pd_master"
         )
-        self.current_id = ShmArray(f"{get_unique_server_name()}_req_id_gen", (2,), dtype=np.int64)
+        self.current_id = ShmArray("req_id_gen", (2,), dtype=np.int64)
         self.current_id.create_shm()
         self.current_id.arr[0] = 0
         self.current_id.arr[1] = 0
-        self.lock = AtomicShmLock(f"{get_unique_server_name()}_req_id_gen_lock")
+        self.lock = AtomicShmLock("req_id_gen_lock")
         self._wait_all_workers_ready()
         logger.info("ReqIDGenerator init finished")
 
     def _wait_all_workers_ready(self):
-        from lightllm.utils.envs_utils import get_unique_server_name
+        if self.args.httpserver_workers == 1:
+            return
+
         from lightllm.server.core.objs.shm_array import ShmArray
 
-        _sync_shm = ShmArray(
-            f"{get_unique_server_name()}_httpworker_start_sync", (self.args.httpserver_workers,), dtype=np.int64
-        )
+        _sync_shm = ShmArray("httpworker_start_sync", (self.args.httpserver_workers,), dtype=np.int64)
         _sync_shm.create_shm()
         # 等待所有 httpserver 的 worker 启动完成，防止重新初始化对应的请求id 对应的shm
         try_count = 0
@@ -78,7 +78,11 @@ class ReqIDGenerator:
             else:
                 while True:
                     try:
-                        config_server_ip_port = f"{self.args.config_server_host}:{self.args.config_server_port}"
+                        from lightllm.utils.shm_port_args import get_shm_port_args
+
+                        config_server_ip_port = (
+                            f"{self.args.config_server_host}:{get_shm_port_args().config_server_port}"
+                        )
                         url = f"http://{config_server_ip_port}/allocate_global_unique_id_range"
                         response = requests.get(url)
                         if response.status_code == 200:

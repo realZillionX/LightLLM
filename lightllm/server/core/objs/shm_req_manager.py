@@ -1,9 +1,8 @@
 import ctypes
 import numpy as np
-from lightllm.utils.envs_utils import get_unique_server_name
 from multiprocessing import shared_memory
 from lightllm.utils.log_utils import init_logger
-from .req import Req, ChunkedPrefillReq, TokenHealingReq
+from .req import Req, ChunkedPrefillReq
 from .shm_array import ShmArray
 from .atomic_array_lock import AtomicShmArrayLock, AtomicLockItem
 from .atomic_lock import AtomicShmLock
@@ -17,7 +16,7 @@ logger = init_logger(__name__)
 
 class ShmReqManager:
     def __init__(self):
-        self.req_class: Req.__class__ = self.get_req_class_type()
+        self.req_class: Req.__class__ = ChunkedPrefillReq
         class_size = ctypes.sizeof(self.req_class)
         self.max_req_num = self.get_max_req_num()
         self.req_shm_byte_size = class_size * self.max_req_num
@@ -28,13 +27,6 @@ class ShmReqManager:
         self.init_manager_lock()
         self.init_alloc_state_shm()
         return
-
-    def get_req_class_type(self):
-        args: StartArgs = get_env_start_args()
-        if args.token_healing_mode:
-            return TokenHealingReq
-
-        return ChunkedPrefillReq
 
     def get_max_req_num(self):
         args: StartArgs = get_env_start_args()
@@ -51,7 +43,7 @@ class ShmReqManager:
             self._init_reqs_shm()
 
     def _init_reqs_shm(self):
-        shm_name = f"{get_unique_server_name()}_req_shm_total"
+        shm_name = "req_shm_total"
         self.reqs_shm = create_or_link_shm(shm_name, self.req_shm_byte_size)
         return
 
@@ -63,7 +55,7 @@ class ShmReqManager:
         return
 
     def init_to_req_locks(self):
-        array_lock_name = f"{get_unique_server_name()}_array_reqs_lock"
+        array_lock_name = "array_reqs_lock"
         self.reqs_lock = AtomicShmArrayLock(array_lock_name, self.max_req_num)
         return
 
@@ -71,13 +63,13 @@ class ShmReqManager:
         return self.reqs_lock.get_lock_context(req_index_in_mem)
 
     def init_manager_lock(self):
-        lock_name = f"{get_unique_server_name()}_shm_reqs_manager_lock"
+        lock_name = "shm_reqs_manager_lock"
         self.manager_lock = AtomicShmLock(lock_name)
         return
 
     def init_alloc_state_shm(self):
-        shm_name = f"{get_unique_server_name()}_req_alloc_states"
-        req_link_list_name = f"{get_unique_server_name()}_req_linked_states"
+        shm_name = "req_alloc_states"
+        req_link_list_name = "req_linked_states"
         self.linked_req_manager = ReqLinkedListManager(req_link_list_name, self.max_req_num)
         self.alloc_state_shm = ShmArray(shm_name, (self.max_req_num,), np.int32)
         self.alloc_state_shm.create_shm()
@@ -114,6 +106,10 @@ class ShmReqManager:
     async def async_release_req_index(self, req_index_in_mem):
         return self.release_req_index(req_index_in_mem)
 
+    def is_idle(self) -> bool:
+        """True when no request slot is currently allocated in shared memory."""
+        return int(np.sum(self.alloc_state_shm.arr)) == 0
+
     # get_req_obj_by_index 和 put_back_req_obj 是 分配好后，进行对象获取和
     # 管理的接口，主要是要进行引用计数的管理。
     def get_req_obj_by_index(self, req_index_in_mem):
@@ -132,6 +128,8 @@ class ShmReqManager:
         req_index_in_mem = req.index_in_shm_mem
         assert req_index_in_mem < self.max_req_num
         assert self.proc_private_get_state[req_index_in_mem] == 1
+        req.detach_shm_arrays()
+
         with self.get_req_lock_by_index(req_index_in_mem):
             req.ref_count = req.ref_count - 1
         self.proc_private_get_state[req_index_in_mem] = 0

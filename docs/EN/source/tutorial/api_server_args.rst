@@ -5,6 +5,50 @@ APIServer Parameter Details
 
 This document provides detailed information about all startup parameters and their usage for LightLLM APIServer.
 
+Vocabulary Parallel Sampling
+----------------------------
+
+.. option:: --target_vocab_topk_sampling {2,8,16,32,64,128,256,512}
+
+    Candidate count communicated by each TP rank for target-model logits. The default ``None`` disables candidate communication.
+
+.. option:: --draft_vocab_topk_sampling {2,8,16,32,64,128,256,512}
+
+    Output candidate count from each TP rank for the draft model. The default ``None`` disables candidate output.
+    The two options independently control the target-model and draft-model output widths.
+    When unset, the corresponding model retains full-vocabulary logits communication and sampling.
+    When set, every TP rank selects local candidates, then one all-gather returns the logits and global
+    token IDs from all TP ranks. The settings also apply at TP=1.
+
+    Fixed-step draft decoding takes argmax over the candidates. The result remains the exact
+    full-vocabulary argmax because every shard contributes its local maximum. Dynamic MTP applies
+    softmax over the gathered candidates to produce simulated scheduling confidence; this is not
+    a full-vocabulary probability and can change dynamic step selection.
+
+    The target model selects the configured candidate count from each TP vocabulary shard before temperature,
+    request top-k, and top-p processing. The output layer then creates full-vocabulary logits, fills
+    non-candidate positions with ``-10000000.0``, and scatters candidate values by global token ID.
+    Downstream code continues through the existing full-vocabulary sampling path without a candidate-ID
+    mapping; existing penalties and invalid-token masking still run after candidate reconstruction.
+    A request top-k of -1 or larger than the gathered candidate count still only covers the candidates.
+    Generated-token logprobs and top-p mass
+    are relative to the candidate set, so enabling target candidates explicitly opts into approximate sampling.
+
+    Features that depend on the original scores of non-candidate tokens cannot recover exact full-vocabulary
+    results. Examples include the complete token ranks required by ``--enable_rl`` or a large logit bias that
+    would have promoted a non-candidate token into the selected set.
+    ``--target_vocab_topk_sampling`` cannot be combined with ``--output_constraint_mode outlines/xgrammar``
+    or ``--first_token_constraint_mode``; inference nodes reject these combinations with a startup assertion.
+    Non-candidate scores are ``-10000000.0``, while constraint masks set forbidden-token scores to ``-1000000.0``.
+    If all allowed tokens are pruned, forbidden tokens receive higher scores. Disable target candidate pruning
+    when using these output constraints. This check does not restrict ``--draft_vocab_topk_sampling``.
+    Use matching settings on PD master, prefill, and decode services.
+
+    Output layers must use the standard Llama ``token_forward``, ``_token_forward``, and
+    ``_lm_head_and_gather`` implementations; normalization overrides are allowed.
+    Model initialization no longer checks output-layer compatibility.
+    Leave the corresponding candidate option unset for nonstandard output heads.
+
 Basic Configuration Parameters
 ------------------------------
 
@@ -18,6 +62,16 @@ Basic Configuration Parameters
     * ``pd_master``: pd master node mode (for pd disaggregation running mode)
     * ``config_server``: Configuration server mode (for pd disaggregation mode, used to register pd_master nodes and get pd_master node list), specifically designed for large-scale, high-concurrency scenarios, used when `pd_master` encounters significant CPU bottlenecks.
 
+.. option:: --performance_mode, --p_mode
+
+    Performance mode for different scenarios, optional values:
+    
+    * ``None``: No performance mode applied (default)
+    * ``personal``: Private personal running mode, automatically sets:
+        - ``running_max_req_size`` to 3
+        - ``batch_max_tokens`` to 2048 (2k)
+        - ``chunked_prefill_size`` to 1024 (1k)
+
 .. option:: --host
 
     Server listening address, default is ``127.0.0.1``
@@ -29,6 +83,18 @@ Basic Configuration Parameters
 .. option:: --httpserver_workers
 
     HTTP server worker process count, default is ``1``
+
+.. option:: --disable_delay_response_start
+
+    Send the status and headers of a streaming response immediately instead of waiting until the first response
+    chunk is ready. By default, LightLLM delays the response start so errors raised before the first chunk can still
+    be returned with the appropriate HTTP status code.
+
+.. option:: --hypercorn_config
+
+    Path to a Hypercorn TOML configuration file. Only TOML configuration files are supported.
+    See ``test/hypercorn_config.toml`` for an example. Default: ``None``. The bind address and HTTP worker
+    count explicitly set by LightLLM override the corresponding values in the configuration file.
 
 .. option:: --zmq_mode
 
@@ -54,9 +120,78 @@ PD disaggregation Mode Parameters
     
     This parameter needs to be set when run_mode is set to prefill or decode
 
-.. option:: --pd_decode_rpyc_port
+.. option:: --pd_master_mode
 
-    Port used by decode nodes for kv move manager rpyc server in PD mode, default is ``42000``
+    PD master topology mode, optional values:
+
+    * ``elastic``: The number of Prefill and Decode nodes can change dynamically (default)
+    * ``<P>p<D>d``: The numbers of Prefill and Decode nodes are fixed. For example,
+      ``2p4d`` expects exactly 2 Prefill nodes and 4 Decode nodes.
+
+    This parameter is used when ``run_mode`` is set to ``pd_master``.
+    In ``elastic`` mode, PD Master becomes ready after at least one Prefill and one Decode node are registered;
+    additional nodes do not make it unready. In a fixed mode, PD Master is ready only when the registered node
+    counts exactly match the configured topology. ``/health``, ``/healthz``, and ``/readiness`` return HTTP 503
+    while the nodes are not ready. In a fixed topology mode, PD Master also requests ``/health`` concurrently
+    from every connected Prefill and Decode node. A failed or timed-out request, or any response other than
+    HTTP 200, makes the PD Master health endpoints return HTTP 503. Independently of the topology mode,
+    PD Master also applies the regular inference-progress health check: while requests remain in flight,
+    the endpoints return HTTP 503 if no request on the PD Master successfully returns a token for
+    ``HEALTH_TIMEOUT`` consecutive seconds.
+
+.. option:: --disable_pd_node_self_request_limit
+
+    P/D-node resource wait limiting is enabled by default and managed centrally by PD Master. Set this option only
+    when disabling the feature, and only when starting PD Master; it is not needed on Prefill or Decode nodes.
+    By default, PD Master supplies
+    ``pd_node_resource_wait_timeout_seconds`` for every request. P/D nodes only enforce the received value for local
+    ``shm_req`` allocation and the wait from Router entry to inference entry; they do not read local limiting switches
+    or timeout settings. The first segment's timeout is
+    controlled on PD Master by ``LIGHTLLM_PD_NODE_RESOURCE_WAIT_TIMEOUT_SECONDS`` and defaults to 10 seconds; set it
+    to -1 to wait indefinitely. Continuation segments with ``segment_index > 0`` use a separate timeout controlled by
+    ``LIGHTLLM_PD_NODE_CONTINUATION_RESOURCE_WAIT_TIMEOUT_SECONDS`` and defaults to 60 seconds, improving the chance
+    that requests which have already produced partial results complete successfully. When set to a non-negative value,
+    a timeout reports ``Server is busy``; a request that has
+    entered the Router but not inference is proactively marked aborted, and PD Master converts this to HTTP 429.
+    While this feature is enabled, PD Master selects P/D nodes again and retries after receiving ``Server is busy``.
+    The maximum probing period is controlled by ``LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS`` and defaults to
+    120 seconds. Once response tokens have been streamed to the client, the request is not restarted because doing so
+    would duplicate output. With ``--disable_pd_node_self_request_limit``, PD Master no longer supplies a finite
+    resource wait timeout; all P/D nodes wait indefinitely, and a ``Server is busy`` raised for another reason is
+    returned immediately without retrying.
+    In multi-node TP deployments, only the master node evaluates the timeout; slave nodes wait indefinitely.
+    The maximum cache-record age eligible for promotion is controlled by
+    ``LIGHTLLM_PD_CACHE_HIGH_PRIORITY_MAX_AGE_SECONDS`` and defaults to
+    36 seconds. Cache-hit promotion also requires at least the number of input tokens configured by
+    ``LIGHTLLM_PD_CACHE_HIGH_PRIORITY_MIN_PROMPT_TOKENS`` (4096 by default), so short requests do not gain priority
+    solely from a high cache-hit rate.
+
+    Startup example:
+
+    .. code-block:: bash
+
+        LIGHTLLM_PD_NODE_RESOURCE_WAIT_TIMEOUT_SECONDS=10 \
+            LIGHTLLM_PD_NODE_CONTINUATION_RESOURCE_WAIT_TIMEOUT_SECONDS=60 \
+            LIGHTLLM_PD_NODE_BUSY_RETRY_TIMEOUT_SECONDS=120 \
+            python -m lightllm.server.api_server --run_mode pd_master ...
+
+.. option:: --disable_pd_cache_high_priority
+
+    Disable PD Master from promoting sufficiently long first-segment requests whose estimated input cache hit rate
+    is high and whose cache record is still fresh. This does not affect segmented continuation requests after PD
+    Decode capacity exhaustion; continuation requests remain high priority. Disabled by default, so eligible requests
+    are promoted unless this option is set.
+
+    Configure this option only on PD Master. When a Prefill node's combined GPU, CPU, and disk cache capacity is small
+    relative to its request working set, later requests can quickly evict reusable cache entries under high load.
+    Requests that could otherwise hit the cache must then repeat Prefill computation, which can significantly reduce
+    Prefill efficiency. In this situation, keep the default high-priority policy enabled so requests with a high
+    estimated cache hit rate can run earlier and reuse their cache entries before eviction.
+
+    This policy changes queue ordering and may increase time to first token (TTFT) for ordinary requests that do not
+    meet the cache-hit-rate, cache-age, or minimum-prompt-token thresholds. Consider setting
+    ``--disable_pd_cache_high_priority`` when Prefill cache capacity is sufficient and cache churn is low, or when
+    scheduling fairness and ordinary-request TTFT are more important than preserving cache-hit efficiency.
 
 .. option:: --config_server_host
 
@@ -122,7 +257,10 @@ Memory and Batch Processing Parameters
 
 .. option:: --max_req_total_len
 
-    Maximum value of request input length + request output length, default is ``16384``
+    Maximum value of request input length + request output length. If not set, it will be
+    automatically derived from model config.json and fall back to ``16384`` if derivation fails.
+    For some RoPE types (like ``yarn/dynamic/su/llama3``), the derivation does not multiply
+    ``rope_scaling.factor`` by ``max_position_embeddings`` to avoid over-estimating the max length.
 
 .. option:: --eos_id
 
@@ -200,6 +338,17 @@ Scheduling Parameters
     
     Aggressive scheduling may cause frequent prefill interruptions during decoding. Disabling it can make the router_max_wait_tokens parameter work more effectively.
 
+.. option:: --enable_prefill_decode_mixed
+
+    Enable mixed prefill and decode scheduling in the same inference step.
+
+    Only supported when ``--run_mode`` is ``normal``. When both prefill and decode requests are pending,
+    the scheduler runs prefill first and then decode in one scheduling step, instead of running only
+    prefill under aggressive scheduling. This improves decode throughput when new prefill requests arrive.
+
+    Cannot be used together with ``--enable_prefill_microbatch_overlap`` or
+    ``--enable_decode_microbatch_overlap``.
+
 .. option:: --disable_dynamic_prompt_cache
 
     Disable kv cache caching
@@ -222,8 +371,6 @@ Scheduling Parameters
 
 Output Constraint Parameters
 ----------------------------
-
-.. option:: --token_healing_mode
 
 .. option:: --output_constraint_mode
 
@@ -249,6 +396,10 @@ Multimodal Parameters
 
     If the model is a multimodal model, set this to not load the audio part model (default is None, auto-detected based on model)
 
+.. option:: --enable_multimodal_url_cache
+
+    Cache image, video, and audio URL content in the local process to avoid repeated downloads. Disabled by default. The maximum number of cached resources defaults to ``512`` and can be configured with ``LIGHTLLM_URL_POOL_MAXSIZE``.
+
 .. option:: --enable_mps
 
     Whether to enable nvidia mps for multimodal services
@@ -256,6 +407,26 @@ Multimodal Parameters
 .. option:: --cache_capacity
 
     Cache server capacity for multimodal resources, default is ``200``
+
+.. option:: --max_image_token_count
+
+    Maximum allowed token count for a single image after tokenization, default is ``6128``
+
+    Requests are rejected when any image exceeds this limit.
+
+.. option:: --max_image_pixels
+
+    Maximum allowed pixel count for a single image before preprocessing resize, default is ``8294400`` (about 4K image pixels).
+
+    If an input image exceeds this threshold, LightLLM automatically resizes it down to this pixel budget before continuing.
+
+    In multimodal PD disaggregation mode, PD Master and every Prefill node must use the same value; otherwise Prefill registration is rejected.
+
+.. option:: --disable_image_resize
+
+    Disable automatic resize for images exceeding ``--max_image_pixels``. Resize is enabled by default.
+
+    In multimodal PD disaggregation mode, PD Master and every Prefill node must use the same value.
 
 .. option:: --visual_infer_batch_size
 
@@ -273,10 +444,6 @@ Multimodal Parameters
 
     Number of data parallel instances for ViT, default is ``1``
 
-.. option:: --visual_nccl_ports
-
-    List of NCCL ports for ViT, e.g., 29500 29501 29502, default is [29500]
-
 .. option:: --vit_att_backend
 
     Set the attention backend for ViT. Available options:
@@ -291,13 +458,13 @@ Multimodal Parameters
 Performance Optimization Parameters
 -----------------------------------
 
-.. option:: --disable_custom_allreduce
+.. option:: --disable_symm_mem_allreduce
 
-    Whether to disable custom allreduce
+    Disable the default SymmMem all-reduce fast path and fall back to NCCL
 
-.. option:: --enable_custom_allgather
+.. option:: --disable_flashinfer_allreduce
 
-    Whether to enable custom allgather
+    Disable the default FlashInfer all-reduce fast path and fall back to SymmMem / NCCL
 
 .. option:: --enable_tpsp_mix_mode
 
@@ -317,21 +484,44 @@ Performance Optimization Parameters
 
 .. option:: --llm_prefill_att_backend
 
-    Set the attention backend for the prefill phase. Available options:
+    Set the attention backend for the prefill phase. For hybrid linear-attention models such as Qwen3.5,
+    the first value selects the full-attention backend and the optional second value selects the
+    linear-attention backend. If the second value is omitted, it defaults to ``auto``.
+
+    Full-attention options:
 
     * ``auto``: Automatically select the best backend (default), with priority fa3 > flashinfer > triton
     * ``fa3``: Use Flash-Attention 3 backend
     * ``flashinfer``: Use FlashInfer backend
     * ``triton``: Use Triton backend
+
+    Linear-attention options for Qwen3.5:
+
+    * ``auto``: Automatically select the best backend (default), with priority flashqla > triton
+    * ``flashqla``: Use FlashQLA backend
+    * ``triton``: Use Triton backend
+
+    Example: ``--llm_prefill_att_backend fa3 flashqla``.
 
 .. option:: --llm_decode_att_backend
 
-    Set the attention backend for the decode phase. Available options:
+    Set the attention backend for the decode phase. For hybrid linear-attention models such as Qwen3.5,
+    the first value selects the full-attention backend and the optional second value selects the
+    linear-attention backend. If the second value is omitted, it defaults to ``auto``.
+
+    Full-attention options:
 
     * ``auto``: Automatically select the best backend (default), with priority fa3 > flashinfer > triton
     * ``fa3``: Use Flash-Attention 3 backend
     * ``flashinfer``: Use FlashInfer backend
     * ``triton``: Use Triton backend
+
+    Linear-attention options for Qwen3.5:
+
+    * ``auto``: Automatically select the best backend (default; currently selects triton)
+    * ``triton``: Use Triton backend
+
+    Example: ``--llm_decode_att_backend flashinfer triton``.
 
 .. option:: --llm_kv_type
 
@@ -342,6 +532,42 @@ Performance Optimization Parameters
     * ``int4kv``: INT4 KV quantization
     * ``fp8kv_sph``: FP8 static per-head quantization, uses fa3 backend
     * ``fp8kv_spt``: FP8 static per-tensor quantization, uses flashinfer backend
+
+.. option:: --linear_att_hash_page_size
+
+    Hash page size for linear attention, default is ``512``.
+
+    This controls the number of tokens per hash bucket, which can affect radix cache reuse.
+
+.. option:: --linear_att_page_block_num
+
+    Number of blocks used for linear-attention state storage, default is ``10000000``.
+
+    This controls the available pages for attention state data, which can affect memory usage and multi-turn chat performance.
+    In current behavior, block size can be approximated as
+    ``linear_att_page_block_num * linear_att_hash_page_size``.
+    When ``linear_att_page_block_num * linear_att_hash_page_size > max_req_total_len``,
+    block-level matching in radix cache is effectively disabled, and request-level small-page matching
+    (small page size is ``linear_att_hash_page_size``) becomes dominant.
+    Under high load, limited small-page capacity plus internal LRU eviction can reduce cache hit rate.
+
+    When ``--enable_cpu_cache`` is enabled, CPU cache page size is forced to
+    ``linear_att_page_block_num * linear_att_hash_page_size`` to satisfy internal reuse constraints.
+
+.. option:: --linear_att_cache_size
+
+    Size of linear-attention cache.
+
+    If not specified, it will be automatically derived from cache-related settings.
+    If small-page cache hits are poor under high load (for example, due to limited small-page count and LRU eviction),
+    increasing this value can improve cache hit rate, at the cost of more memory usage.
+
+.. option:: --linear_att_ssm_data_type
+
+    Data type of linear-attention SSM state, optional values:
+
+    * ``bfloat16``
+    * ``float32`` (default)
 
 .. option:: --disable_cudagraph
 
@@ -374,18 +600,76 @@ Quantization Parameters
 
 .. option:: --quant_type
 
-    Quantization method, optional values:
+    ``W`` denotes weights and ``A`` denotes activations. The available values are listed below.
 
-    * ``vllm-w8a8``
-    * ``vllm-fp8w8a8``
-    * ``vllm-fp8w8a8-b128``
-    * ``deepgemm-fp8w8a8-b128``
-    * ``triton-fp8w8a8-block128``
-    * ``triton-fp8w8a8g128``: weight per-channel quant and activation per-group 128 quant
-    * ``triton-fp8w8a8g64``: weight per-channel quantization with group size 64
-    * ``awq``
-    * ``awq_marlin``
-    * ``none`` (default)
+    .. list-table::
+       :header-rows: 1
+       :widths: 35 45 20
+       :align: left
+
+       * - ``quant_type``
+         - Quantization
+         - Implementation backend
+       * - ``w8a8``
+         - INT8 W8A8; W: per-channel, A: per-token
+         - vLLM
+       * - ``fp8w8a8``
+         - FP8 W8A8; W: per-channel, A: per-token
+         - vLLM
+       * - ``fp8w8a8-pt``
+         - FP8 W8A8; W: per-tensor, A: per-token
+         - Triton
+       * - ``fp8w8a8-b128``
+         - FP8 W8A8; W: per-block 128×128, A: per-token-group 128
+         - Triton
+       * - ``fp8w8a8g128``
+         - FP8 W8A8; W: per-channel, A: per-token-group 128
+         - Triton
+       * - ``fp8w8a8g64``
+         - FP8 W8A8; W: per-channel, A: per-token-group 64
+         - Triton
+       * - ``awq``
+         - INT4 weight-only; group size comes from the checkpoint
+         - vLLM
+       * - ``awq_marlin``
+         - INT4 weight-only; group size comes from the checkpoint
+         - vLLM
+       * - ``none``
+         - No quantization
+         - -
+       * - ``w8a8-vllm``
+         - INT8 W8A8; W: per-channel, A: per-token
+         - vLLM
+       * - ``fp8w8a8-vllm``
+         - FP8 W8A8; W: per-channel, A: per-token
+         - vLLM
+       * - ``fp8w8a8-pt-vllm``
+         - FP8 W8A8; W: per-tensor, A: per-token
+         - vLLM
+       * - ``fp8w8a8-pt-sgl``
+         - FP8 W8A8; W: per-tensor, A: per-token
+         - SGL
+       * - ``fp8w8a8-pt-triton``
+         - FP8 W8A8; W: per-tensor, A: per-token
+         - Triton
+       * - ``fp8w8a8-b128-vllm``
+         - FP8 W8A8; W: per-block 128×128, A: per-token-group 128
+         - vLLM
+       * - ``fp8w8a8-b128-deepgemm``
+         - FP8 W8A8; W: per-block 128×128, A: per-token-group 128
+         - DeepGEMM
+       * - ``fp8w8a8-b128-triton``
+         - FP8 W8A8; W: per-block 128×128, A: per-token-group 128
+         - Triton
+       * - ``fp8w8a8g128-triton``
+         - FP8 W8A8; W: per-channel, A: per-token-group 128
+         - Triton
+       * - ``fp8w8a8g64-triton``
+         - FP8 W8A8; W: per-channel, A: per-token-group 64
+         - Triton
+       * - ``fp4fp8-b32-deepgemm``
+         - FP4/FP8 mixed quantization; fused MoE expert weights only (SM100)
+         - DeepGEMM
 
 .. option:: --quant_cfg
 
@@ -393,12 +677,20 @@ Quantization Parameters
     
     Examples can be found in test/advanced_config/mixed_quantization/llamacls-mix-down.yaml.
 
+.. option:: --expert_dtype
+
+    Expert quantization dtype for EP MoE, optional values:
+
+    * ``fp8``
+    * ``fp4``: SM100 GPUs only
+    * ``None`` (default)
+
 .. option:: --vit_quant_type
 
     ViT quantization method, optional values:
 
-    * ``vllm-w8a8``
-    * ``vllm-fp8w8a8``
+    * ``w8a8``
+    * ``fp8w8a8``
     * ``none`` (default)
 
 .. option:: --vit_quant_cfg
@@ -417,21 +709,13 @@ Sampling and Generation Parameters
     * ``triton``: Use torch and triton kernel (default)
     * ``sglang_kernel``: Use sglang_kernel implementation
 
-.. option:: --return_all_prompt_logprobs
+.. option:: --enable_prompt_logprobs
 
-    Return logprobs for all prompt tokens
+    Enable prompt top-k logprobs capture
 
 .. option:: --use_reward_model
 
     Use reward model
-
-.. option:: --long_truncation_mode
-
-    How to handle when input_token_len + max_new_tokens > max_req_total_len, optional values:
-    
-    * ``None``: Throw exception (default)
-    * ``head``: Remove some head tokens to make input_token_len + max_new_tokens <= max_req_total_len
-    * ``center``: Remove some tokens at the center position to make input_token_len + max_new_tokens <= max_req_total_len
 
 .. option:: --use_tgi_api
 
@@ -477,14 +761,6 @@ DeepSeek Redundant Expert Parameters
 
 Monitoring and Logging Parameters
 ---------------------------------
-
-.. option:: --disable_log_stats
-
-    Disable throughput statistics logging
-
-.. option:: --log_stats_interval
-
-    Interval for recording statistics (seconds), default is ``10``
 
 .. option:: --health_monitor
 

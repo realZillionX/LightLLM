@@ -1,8 +1,8 @@
 import argparse
 
 
-def make_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.formatter_class = argparse.RawTextHelpFormatter
 
     parser.add_argument(
         "--run_mode",
@@ -11,21 +11,43 @@ def make_argument_parser() -> argparse.ArgumentParser:
             "normal",
             "prefill",
             "decode",
-            "nixl_prefill",
-            "nixl_decode",
             "pd_master",
             "config_server",
             "visual_only",
         ],
         default="normal",
-        help="""set run mode, normal is started for a single server, prefill decode pd_master is for pd split run mode,
+        help="""set run mode, normal is started for a single server, prefill/decode/pd_master is for pd split run mode,
                 config_server is for pd split mode used to register pd_master node, and get pd_master node list,
                 specifically designed for large-scale, high-concurrency scenarios where `pd_master` encounters
                 significant CPU bottlenecks.""",
     )
+    parser.add_argument(
+        "--performance_mode",
+        "--p_mode",
+        type=str,
+        choices=["personal"],
+        default=None,
+        help="""performance mode for different scenarios.
+                None: no performance mode applied (default).
+                personal: private personal running mode, automatically sets running_max_req_size to 3.""",
+    )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--httpserver_workers", type=int, default=1)
+    parser.add_argument(
+        "--disable_delay_response_start",
+        action="store_true",
+        help=(
+            "Send streaming response status and headers immediately instead of waiting until the first "
+            "response chunk is ready."
+        ),
+    )
+    parser.add_argument(
+        "--hypercorn_config",
+        type=str,
+        default=None,
+        help="Path to a Hypercorn TOML configuration file. See test/hypercorn_config.toml for an example.",
+    )
     parser.add_argument(
         "--zmq_mode",
         type=str,
@@ -46,17 +68,50 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="when run_mode set to prefill or decode, you need set this pd_mater_port",
     )
     parser.add_argument(
-        "--pd_decode_rpyc_port",
-        type=int,
-        default=None,
-        help="p d mode, decode node used for kv move manager rpyc server port",
+        "--pd_master_mode",
+        type=str,
+        default="elastic",
+        help=(
+            "PD master topology mode: elastic allows the number of Prefill and Decode nodes to change "
+            "dynamically; use <P>p<D>d for a fixed topology, for example 2p4d. Default: elastic."
+        ),
+    )
+    parser.add_argument(
+        "--disable_pd_node_self_request_limit",
+        action="store_true",
+        help=(
+            "Disable PD Master-managed resource wait limiting and retries for requests rejected as server busy. "
+            "Configure this option only on PD Master. By default, PD Master sends timeout details to P/D nodes, "
+            "which only enforce the received values, and retries busy requests."
+        ),
+    )
+    parser.add_argument(
+        "--disable_pd_cache_high_priority",
+        action="store_true",
+        help=(
+            "Disable PD Master's high-priority scheduling for first-segment requests with a fresh, high "
+            "cache-hit estimate. Keep this policy enabled when a Prefill node's combined GPU, CPU, and disk "
+            "cache is small relative to its workload: under high load, ordinary scheduling can evict reusable "
+            "cache entries before they are consumed and significantly reduce Prefill efficiency. The policy "
+            "lets eligible cache-hit requests run earlier, but may increase TTFT for ordinary requests. "
+            "Consider disabling it only when scheduling fairness or ordinary-request latency is more important, "
+            "or when cache capacity is sufficient and cache churn is low. Segmented continuation requests remain "
+            "high priority. Configure this option only on PD Master. The policy is enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--pd_trans_mode",
+        type=str,
+        choices=["nccl", "nixl"],
+        default="nccl",
+        help="KV transfer backend for PD disaggregation; default: nccl",
     )
     parser.add_argument(
         "--select_p_d_node_strategy",
         type=str,
-        default="round_robin",
-        choices=["random", "round_robin", "adaptive_load"],
-        help="pd master use this strategy to select p d node, can be round_robin, random or adaptive_load",
+        default="cache_aware",
+        choices=["random", "round_robin", "adaptive_load", "cache_aware"],
+        help="pd master use this strategy to select p d node; default cache_aware",
     )
     parser.add_argument(
         "--config_server_host",
@@ -79,17 +134,17 @@ def make_argument_parser() -> argparse.ArgumentParser:
         proxy module use config server to find  remote vit infer nodes to infer img""",
     )
     parser.add_argument(
-        "--nixl_pd_kv_page_num",
+        "--pd_kv_page_num",
         type=int,
         default=16,
-        help="nixl pd mode, kv move page_num",
+        help="pd mode, kv move page_num",
     )
 
     parser.add_argument(
-        "--nixl_pd_kv_page_size",
+        "--pd_kv_page_size",
         type=int,
         default=1024,
-        help="nixl pd mode, kv page size.",
+        help="pd mode, kv page size.",
     )
 
     parser.add_argument(
@@ -135,8 +190,8 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mem_fraction",
         type=float,
-        default=0.9,
-        help="""Memory usage ratio, default is 0.9, you can specify a smaller value if OOM occurs at runtime.
+        default=0.8,
+        help="""Memory usage ratio, default is 0.8, you can specify a smaller value if OOM occurs at runtime.
         If max_total_token_num is not specified, it will be calculated automatically based on this value.""",
     )
     parser.add_argument(
@@ -183,6 +238,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
             "step3",
             "nano_v3",
             "interns1",
+            "gemma4",
         ],
         default=None,
         help="reasoning parser type",
@@ -236,8 +292,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max_req_total_len",
         type=int,
-        default=16384,
+        default=None,
         help="Maximum allowed length for a request (input tokens + output tokens). "
+        "If None, it will be automatically derived from the model config.json, "
+        "and fall back to 16384 if derivation fails. "
         "In PD (Prefill-Decode) mode, this value must be synchronized across the "
         "PD master, prefill, and decode nodes.",
     )
@@ -264,8 +322,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
     )
     parser.add_argument("--detail_log", action="store_true", help="enable to print input infos in requests.")
-    parser.add_argument("--disable_log_stats", action="store_true", help="disable logging throughput stats.")
-    parser.add_argument("--log_stats_interval", type=int, default=10, help="log stats interval in second.")
     parser.add_argument(
         "--disable_shm_warning",
         action="store_true",
@@ -300,6 +356,12 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="""aggressive schedule can lead to frequent prefill interruptions during decode.
                 disabling it allows the router_max_wait_tokens parameter to work more effectively.""",
     )
+    parser.add_argument(
+        "--enable_prefill_decode_mixed",
+        action="store_true",
+        help="""when run_mode is normal, allow prefill and decode requests to run in the same
+        scheduling step when both exist, improving throughput under aggressive schedule.""",
+    )
 
     parser.add_argument(
         "--use_dynamic_prompt_cache", action="store_true", help="This argument is deprecated and no longer in use."
@@ -308,8 +370,29 @@ def make_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--chunked_prefill_size", type=int, default=None, help="chunked prefill size")
     parser.add_argument("--disable_chunked_prefill", action="store_true", help="whether to disable chunked prefill")
+    parser.add_argument(
+        "--short_prefill_token_threshold",
+        type=int,
+        default=None,
+        help="""Enable short prefill request priority scheduling.
+        The remaining tokens are calculated after prefix-cache matching. Disabled by default.""",
+    )
     parser.add_argument("--diverse_mode", action="store_true", help="diversity generation mode")
-    parser.add_argument("--token_healing_mode", action="store_true", help="code model infer mode")
+    vocab_topk_choices = [2, 8, 16, 32, 64, 128, 256, 512]
+    parser.add_argument(
+        "--target_vocab_topk_sampling",
+        type=int,
+        choices=vocab_topk_choices,
+        default=None,
+        help="Top-k communication width per TP rank for target-model logits; disabled by default.",
+    )
+    parser.add_argument(
+        "--draft_vocab_topk_sampling",
+        type=int,
+        choices=vocab_topk_choices,
+        default=None,
+        help="Top-k candidate count per TP rank for draft-model output; disabled by default.",
+    )
 
     parser.add_argument(
         "--output_constraint_mode",
@@ -370,10 +453,23 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Path of the x2v config file.",
     )
     parser.add_argument(
+        "--enable_multimodal_url_cache",
+        action="store_true",
+        help="cache image, video, and audio URL content in the local process to avoid repeated downloads.",
+    )
+    parser.add_argument(
         "--enable_mps", action="store_true", help="Whether to enable nvidia mps for multimodal service."
     )
-    parser.add_argument("--disable_custom_allreduce", action="store_true", help="Whether to disable cutom allreduce.")
-    parser.add_argument("--enable_custom_allgather", action="store_true", help="Whether to enable cutom allgather.")
+    parser.add_argument(
+        "--disable_symm_mem_allreduce",
+        action="store_true",
+        help="Disable the default SymmMem all-reduce fast path and fall back to NCCL.",
+    )
+    parser.add_argument(
+        "--disable_flashinfer_allreduce",
+        action="store_true",
+        help="Disable the default FlashInfer all-reduce fast path and fall back to SymmMem / NCCL.",
+    )
     parser.add_argument(
         "--enable_tpsp_mix_mode",
         action="store_true",
@@ -401,11 +497,13 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--llm_prefill_att_backend",
         type=str,
         nargs="+",
-        choices=["auto", "triton", "fa3", "flashinfer"],
+        choices=["auto", "triton", "fa3", "flashinfer", "flashqla"],
         default=["auto"],
         help="""prefill attention kernel used in llm.
                 auto: automatically select best backend based on GPU and available packages
-                (priority: fa3 > flashinfer > triton)""",
+                (priority: fa3 > flashinfer > triton)
+                for hybrid linear-attention models, the second value selects the linear-attention backend
+                (priority: flashqla > triton); when omitted, it defaults to auto""",
     )
     parser.add_argument(
         "--llm_decode_att_backend",
@@ -415,7 +513,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=["auto"],
         help="""decode attention kernel used in llm.
                 auto: automatically select best backend based on GPU and available packages
-                (priority: fa3 > flashinfer > triton)""",
+                (priority when mtp_step > 0: fa3 > flashinfer > triton;
+                otherwise: flashinfer > fa3 > triton)
+                for hybrid linear-attention models, the second value selects the linear-attention backend
+                (currently triton only); when omitted, it defaults to auto""",
     )
     parser.add_argument(
         "--vit_att_backend",
@@ -456,6 +557,23 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--cache_capacity", type=int, default=200, help="cache server capacity for multimodal resources"
     )
     parser.add_argument(
+        "--max_image_token_count",
+        type=int,
+        default=8192,
+        help="maximum allowed token count for one image after tokenization",
+    )
+    parser.add_argument(
+        "--max_image_pixels",
+        type=int,
+        default=3686400,  # 8294400 is 4k, 3686400 is 2k
+        help="maximum allowed pixel count for one image before resize preprocessing",
+    )
+    parser.add_argument(
+        "--disable_image_resize",
+        action="store_true",
+        help="disable automatic resize for images exceeding --max_image_pixels (enabled by default)",
+    )
+    parser.add_argument(
         "--embed_cache_storage_size",
         type=float,
         default=4,
@@ -468,20 +586,14 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="the data type of the model weight",
     )
-    parser.add_argument("--return_all_prompt_logprobs", action="store_true", help="return all prompt tokens logprobs")
+    parser.add_argument(
+        "--enable_prompt_logprobs",
+        action="store_true",
+        help="enable prompt top-k logprobs capture",
+    )
 
     parser.add_argument("--use_reward_model", action="store_true", help="use reward model")
 
-    parser.add_argument(
-        "--long_truncation_mode",
-        type=str,
-        choices=[None, "head", "center"],
-        default=None,
-        help="""use to select the handle way when input_token_len + max_new_tokens > max_req_total_len.
-        None : raise Exception
-        head : remove some head tokens to make input_token_len + max_new_tokens <= max_req_total_len
-        center : remove some tokens in center loc to make input_token_len + max_new_tokens <= max_req_total_len""",
-    )
     parser.add_argument("--use_tgi_api", action="store_true", help="use tgi input and ouput format")
     parser.add_argument(
         "--health_monitor", action="store_true", help="check the health of service and restart when error"
@@ -510,13 +622,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual_tp", type=int, default=1, help="number of tensort parallel instances for ViT")
     parser.add_argument("--visual_dp", type=int, default=1, help="number of data parallel instances for ViT")
     parser.add_argument(
-        "--visual_nccl_ports",
-        nargs="+",
-        type=int,
-        default=None,
-        help="List of NCCL ports to build a distributed environment for Vit, e.g., 29500 29501 29502",
-    )
-    parser.add_argument(
         "--visual_rpyc_port",
         type=int,
         default=None,
@@ -535,13 +640,6 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="Tensor parallel size for audio encoder (only 1 is supported; use audio_dp to scale)",
     )
     parser.add_argument("--audio_dp", type=int, default=1, help="Data parallel replicas for audio encoder")
-    parser.add_argument(
-        "--audio_nccl_ports",
-        nargs="+",
-        type=int,
-        default=None,
-        help="NCCL ports per audio DP group; if omitted, auto-allocated in api_start (reserved until audio_tp>1)",
-    )
     parser.add_argument(
         "--audio_infer_batch_size",
         type=int,
@@ -571,7 +669,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
         " currently only for llama and qwen model, not support ep moe model",
     )
     parser.add_argument(
-        "--prefll_cudagraph_max_handle_token", type=int, default=512, help="max handle token num for prefill cudagraph"
+        "--prefill_cudagraph_max_handle_token",
+        type=int,
+        default=8192,
+        help="max handle token num for prefill cudagraph",
     )
 
     parser.add_argument(
@@ -612,10 +713,30 @@ def make_argument_parser() -> argparse.ArgumentParser:
         "--quant_type",
         type=str,
         default="none",
-        help="""Quantization method: vllm-w8a8 | vllm-fp8w8a8 | vllm-fp8w8a8-b128
-                        | deepgemm-fp8w8a8-b128 | triton-fp8w8a8-block128 | awq | awq_marlin |
-                        | triton-fp8w8a8g128 (weight perchannel quant and act per group quant) |
-                        triton-fp8w8a8g64 (weight perchannel quantization with group size 64)""",
+        help=(
+            "Quantization methods (W = weight, A = activation):\n"
+            "  quant_type                     quantization                           implementation backend\n"
+            "  w8a8                           INT8; W per-channel, A per-token       vLLM\n"
+            "  fp8w8a8                        FP8; W per-channel, A per-token        vLLM\n"
+            "  fp8w8a8-pt                     FP8; W per-tensor, A per-token         Triton\n"
+            "  fp8w8a8-b128                   FP8; W block 128x128, A group 128      Triton\n"
+            "  fp8w8a8g128                    FP8; W per-channel, A group 128        Triton\n"
+            "  fp8w8a8g64                     FP8; W per-channel, A group 64         Triton\n"
+            "  awq                            INT4 weight-only; checkpoint group     vLLM\n"
+            "  awq_marlin                     INT4 weight-only; checkpoint group     vLLM\n"
+            "  none                           No quantization                        -\n"
+            "  w8a8-vllm                      INT8; W per-channel, A per-token       vLLM\n"
+            "  fp8w8a8-vllm                   FP8; W per-channel, A per-token        vLLM\n"
+            "  fp8w8a8-pt-vllm                FP8; W per-tensor, A per-token         vLLM\n"
+            "  fp8w8a8-pt-sgl                 FP8; W per-tensor, A per-token         SGL\n"
+            "  fp8w8a8-pt-triton              FP8; W per-tensor, A per-token         Triton\n"
+            "  fp8w8a8-b128-vllm              FP8; W block 128x128, A group 128      vLLM\n"
+            "  fp8w8a8-b128-deepgemm          FP8; W block 128x128, A group 128      DeepGEMM\n"
+            "  fp8w8a8-b128-triton            FP8; W block 128x128, A group 128      Triton\n"
+            "  fp8w8a8g128-triton             FP8; W per-channel, A group 128        Triton\n"
+            "  fp8w8a8g64-triton              FP8; W per-channel, A group 64         Triton\n"
+            "  fp4fp8-b32-deepgemm            FP4/FP8; fused MoE experts only        DeepGEMM"
+        ),
     )
     parser.add_argument(
         "--quant_cfg",
@@ -625,10 +746,18 @@ def make_argument_parser() -> argparse.ArgumentParser:
             Examples can be found in test/advanced_config/mixed_quantization/llamacls-mix-down.yaml.""",
     )
     parser.add_argument(
+        "--expert_dtype",
+        type=str,
+        default=None,
+        choices=["fp8", "fp4"],
+        help="""Expert quantization dtype for EP MoE. Supported values are
+            fp8 and fp4. Note that fp4 is only supported on SM100 GPUs.""",
+    )
+    parser.add_argument(
         "--vit_quant_type",
         type=str,
         default="none",
-        help="""Quantization method for ViT: vllm-w8a8 | vllm-fp8w8a8""",
+        help="""Quantization method for ViT: w8a8 | fp8w8a8""",
     )
     parser.add_argument(
         "--vit_quant_cfg",
@@ -640,10 +769,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sampling_backend",
         type=str,
-        choices=["triton", "sglang_kernel"],
+        choices=["triton", "flashinfer"],
         default="triton",
         help="""sampling used impl. 'triton' is use torch and triton kernel,
-        sglang_kernel use sglang_kernel impl""",
+        flashinfer use flashinfer sampling impl""",
     )
     parser.add_argument(
         "--penalty_counter_mode",
@@ -684,7 +813,7 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable_fused_shared_experts",
         action="store_true",
-        help="""Whether to enable fused shared experts for deepseekv3 model. only work when tensor parallelism""",
+        help="""Whether to enable fused shared experts for supported MoE models. It is auto-enabled when supported.""",
     )
     parser.add_argument(
         "--mtp_mode",
@@ -693,31 +822,36 @@ def make_argument_parser() -> argparse.ArgumentParser:
             "eagle_with_att",
             "vanilla_no_att",
             "eagle_no_att",
+            "eagle3",
+            "dspark",
+            "dflash",
             None,
         ],
         default=None,
-        help="""Supported MTP modes.
-        None: Disables MTP.
-        *_with_att: Uses the MTP model with an attention mechanism to predict the next draft token.
-        *_no_att: Uses the MTP model without an attention module to predict the next draft token.""",
+        help="""Speculative decoding mode.
+        *_with_att and *_no_att select attention or non-attention draft models;
+        eagle3 uses autoregressive EAGLE-3 drafting; dflash uses block-diffusion drafting;
+        dspark uses semi-autoregressive parallel drafting.""",
     )
     parser.add_argument(
         "--mtp_draft_model_dir",
         type=str,
         nargs="+",
         default=None,
-        help="""Path to the draft model for the MTP multi-prediction feature,
-        used for loading the MTP multi-output token model.""",
+        help="""Path to the speculative draft model. The legacy option name is
+        retained for command-line compatibility.""",
     )
     parser.add_argument(
         "--mtp_step",
         type=int,
         default=0,
-        help="""Specifies the number of additional tokens to predict using the draft model.
-        Currently, this feature supports only the DeepSeekV3 model.
-        Increasing this value allows for more predictions,
-        but ensure that the model is compatible with the specified step count.
-        currently, deepseekv3 model only support 1 step""",
+        help="""Number of additional draft tokens per request.
+        For DSpark and DFlash this value is derived from the draft checkpoint block_size.""",
+    )
+    parser.add_argument(
+        "--mtp_dynamic_verify",
+        action="store_true",
+        help="""Enable dynamic speculative scheduling.""",
     )
     parser.add_argument(
         "--kv_quant_calibration_config_path",
@@ -750,7 +884,9 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable_cpu_cache",
         action="store_true",
-        help="""enable cpu cache to store kv cache. prefer to use hugepages for better performance.""",
+        help="""enable cpu cache to store kv cache. prefer to use hugepages for better performance.
+        For linear attention cache reuse constraints, cpu cache token page size will be forced to
+        linear_att_page_block_num * linear_att_hash_page_size when cpu cache is enabled.""",
     )
     parser.add_argument(
         "--cpu_cache_storage_size",
@@ -764,10 +900,33 @@ def make_argument_parser() -> argparse.ArgumentParser:
         default=256,
         help="""The token page size of cpu cache""",
     )
+    parser.add_argument(
+        "--cache_placement_strategy",
+        type=str,
+        choices=["adaptive", "legacy"],
+        default="adaptive",
+        help="""Cache placement strategy used when CPU cache is enabled.
+        adaptive: place requests between GPU and the lower-tier cache path based on recent input lengths and capacity;
+        Disk placement is offloaded through CPU cache, so CPU and Disk capacities are not additive.
+        legacy: retain GPU cache and also copy each request to every enabled lower cache level.""",
+    )
     parser.add_argument("--enable_disk_cache", action="store_true", help="""enable disk cache to store kv cache.""")
     parser.add_argument(
         "--disk_cache_storage_size", type=float, default=10, help="""The capacity of disk cache. GB used."""
     )
+    parser.add_argument(
+        "--enable_rl",
+        action="store_true",
+        default=False,
+        help="""enable RL control plane (HTTP APIs, router rl_rpyc, model RlBackendOps).
+        When disabled (default), RL routes/services are not started.""",
+    )
+    parser.add_argument(
+        "--enable_torch_memory_saver",
+        action="store_true",
+        help="""enable torch memory saver, which is used for release_memory and resume_memory during RL training.""",
+    )
+    parser.add_argument("--enable_weight_cpu_backup", action="store_true", help="""enable weight cpu backup.""")
     parser.add_argument(
         "--disk_cache_dir",
         type=str,
@@ -781,31 +940,45 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="""Enable prefix prompt cache fetch for data parallel inference, disabled by default.""",
     )
     parser.add_argument(
-        "--mamba_cache_size",
+        "--linear_att_hash_page_size",
+        type=int,
+        default=512,
+        help="""The hash page size for linear attention.
+        It controls the number of tokens in each hash bucket, which can affect radix cache reused""",
+    )
+    parser.add_argument(
+        "--linear_att_page_block_num",
+        type=int,
+        default=10000000,
+        help="""The number of blocks for linear attention state storage.
+        It controls the number of pages used for storing the attention state,
+        which can affect memory usage and mutiturn chat performance.
+        Block size is linear_att_page_block_num * linear_att_hash_page_size.
+        When this value multiplied by linear_att_hash_page_size is greater than max_req_total_len,
+        block-level matching in radix cache is effectively disabled and request-level small-page
+        matching (linear_att_hash_page_size) may dominate.""",
+    )
+    parser.add_argument(
+        "--linear_att_cache_size",
         type=int,
         default=None,
-        help="""The size of linear attn cache. If not specified, will be calculated
-        automatically based on mamba_cache_ratio or max_total_token_num.""",
+        help="""The size of linear attn cache.
+        If radix cache hit rate is low under high load due to limited small-page capacity and LRU
+        eviction, increasing linear_att_cache_size can improve hit rate at the cost of more memory.""",
     )
     parser.add_argument(
-        "--mamba_cache_ratio",
-        type=lambda v: float(v)
-        if 0.0 <= (_ := float(v)) <= 1.0
-        else (_ for _ in ()).throw(
-            argparse.ArgumentTypeError(f"--mamba_cache_ratio must be between 0.0 and 1.0, got {v}")
-        ),
-        default=0.5,
-        help="""Ratio of mamba cache to total cache memory (mamba + KV).
-        Only effective when both mamba_cache_size and max_total_token_num are not set.
-        Default is 0.5 (50%% mamba cache, 50%% KV cache).
-        Example: 0.3 -> 30%% mamba, 70%% KV; 0.7 -> 70%% mamba, 30%% KV.""",
-    )
-    parser.add_argument(
-        "--mamba_ssm_data_type",
+        "--linear_att_ssm_data_type",
         type=str,
         choices=["bfloat16", "float32"],
         default="float32",
-        help="the data type of the model weight",
+        help="the data type of linear att smm data type",
+    )
+    parser.add_argument(
+        "--disable_linear_att_small_page_cpu_cache",
+        action="store_true",
+        default=False,
+        help="""Disable storing linear attention small page data in CPU cache.
+        This reduces CPU cache memory waste but also decreases the hit length.""",
     )
     parser.add_argument(
         "--hardware_platform",
@@ -827,4 +1000,29 @@ def make_argument_parser() -> argparse.ArgumentParser:
         If the op is not implemented for the platform and the hardware support triton,
         it will use triton implementation.""",
     )
+    parser.add_argument(
+        "--enable_return_routed_experts",
+        action="store_true",
+        default=False,
+        help="Enable returning routed expert indices for MoE models (R3 feature).",
+    )
+    parser.add_argument(
+        "--enable_profiling",
+        type=str,
+        choices=["torch_profiler", "nvtx"],
+        default=None,
+        help="""Enable profiler support.
+                This will expose '/profiler_start' and '/profiler_stop' API,
+                below profiling features will only be enabled in this range.
+                Options:
+                'torch_profiler': will setup torch.profiler.profile(), trace files will be saved to './trace',
+                or set by 'LIGHTLLM_TRACE_DIR' env;
+                'nvtx': will add NVTX marks for external profiler like NVIDIA Nsight System
+                (you should set it up by yourself).
+                A NVTX range named 'LIGHTLLM_PROFILE' will be added within the profiling range.""",
+    )
     return parser
+
+
+def make_argument_parser() -> argparse.ArgumentParser:
+    return add_cli_args(argparse.ArgumentParser())

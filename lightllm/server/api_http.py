@@ -26,7 +26,6 @@ import base64
 import os
 import re
 from io import BytesIO
-import pickle
 import setproctitle
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -46,14 +45,16 @@ from .multimodal_params import MultimodalParams
 from .httpserver.manager import HttpServerManager
 from .httpserver_for_pd_master.manager import HttpServerManagerForPDMaster
 from .api_lightllm import lightllm_get_score
-from lightllm.utils.envs_utils import get_env_start_args, get_lightllm_websocket_max_message_size
+from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.log_utils import init_logger
-from lightllm.utils.error_utils import ServerBusyError
+from lightllm.utils.error_utils import ClientDisconnected, InvalidRequestError, SERVER_BUSY_MESSAGE, ServerBusyError
 from lightllm.server.metrics.manager import MetricClient
 from lightllm.utils.envs_utils import get_unique_server_name
-from dataclasses import dataclass
+from lightllm.utils.shm_port_args import get_shm_port_args
+from dataclasses import asdict, dataclass, is_dataclass
 
 from .api_openai import chat_completions_impl, completions_impl, chat_completions_impl_v2
+from .api_errors import create_error_response, create_server_busy_response
 from .api_models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -109,22 +110,24 @@ class G_Objs:
 
         setproctitle.setproctitle(f"lightllm::{get_unique_server_name()}::api_server")
 
+        init_tokenizer(args)  # for openai api
+        SamplingParams.load_generation_cfg(args.model_dir)
+        CompletionRequest.load_generation_cfg(args.model_dir)
+        ChatCompletionRequest.load_generation_cfg(args.model_dir)
+
+        if self.model_created is None:
+            self.model_created = int(time.time())
+
         if args.run_mode == "pd_master":
-            self.metric_client = MetricClient(args.metric_port)
+            self.metric_client = MetricClient(get_shm_port_args().metric_port)
             self.httpserver_manager = HttpServerManagerForPDMaster(
                 args=args,
             )
         else:
-            init_tokenizer(args)  # for openai api
-            SamplingParams.load_generation_cfg(args.model_dir)
-            CompletionRequest.load_generation_cfg(args.model_dir)
-            ChatCompletionRequest.load_generation_cfg(args.model_dir)
-            self.metric_client = MetricClient(args.metric_port)
+            self.metric_client = MetricClient(get_shm_port_args().metric_port)
             self.httpserver_manager = HttpServerManager(args=args)
             dp_size_in_node = max(1, args.dp // args.nnodes)  # 兼容多机纯tp的运行模式，这时候 1 // 2 == 0, 需要兼容
-            self.shared_token_load = TokenLoad(f"{get_unique_server_name()}_shared_token_load", dp_size_in_node)
-            if self.model_created is None:
-                self.model_created = int(time.time())
+            self.shared_token_load = TokenLoad("shared_token_load", dp_size_in_node)
 
 
 g_objs = G_Objs()
@@ -132,10 +135,66 @@ g_objs = G_Objs()
 app = FastAPI()
 g_objs.app = app
 
+_ACCESS_LOG_STATUS_COLORS = {2: "\033[32m", 3: "\033[36m", 4: "\033[33m", 5: "\033[31m"}
+_ACCESS_LOG_RESET = "\033[0m"
 
-def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse:
-    g_objs.metric_client.counter_inc("lightllm_request_failure")
-    return JSONResponse({"message": message}, status_code=status_code.value)
+
+class _AccessLogMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        status_holder = {"status": 0}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                status_holder["status"] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            if scope["type"] == "http":
+                status = status_holder["status"]
+                msg = f"{scope['method']} {scope['path']} {status}"
+                color = _ACCESS_LOG_STATUS_COLORS.get(status // 100, "")
+                if color:
+                    msg = color + msg + _ACCESS_LOG_RESET
+                logger.info(msg)
+
+
+app.add_middleware(_AccessLogMiddleware)
+
+
+@app.exception_handler(ServerBusyError)
+async def server_busy_exception_handler(request: Request, exc: ServerBusyError) -> JSONResponse:
+    logger.warning("Server busy detail: %s", exc.message)
+
+    # Streaming responses can raise during their first body iteration, after
+    # the route handler has already returned. Preserve the Anthropic error
+    # envelope for that deferred failure path as well.
+    if request.url.path == "/v1/messages":
+        from .api_anthropic import _anthropic_error_response
+
+        g_objs.metric_client.counter_inc("lightllm_request_failure")
+        return _anthropic_error_response(HTTPStatus(exc.status_code), SERVER_BUSY_MESSAGE)
+
+    return create_server_busy_response(exc)
+
+
+@app.exception_handler(InvalidRequestError)
+async def invalid_request_exception_handler(request: Request, exc: InvalidRequestError) -> JSONResponse:
+    if request.url.path == "/v1/messages":
+        from .api_anthropic import _anthropic_error_response
+
+        g_objs.metric_client.counter_inc("lightllm_request_failure")
+        return _anthropic_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+
+    return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
 
 
 @app.get("/liveness")
@@ -147,6 +206,12 @@ def liveness():
 @app.get("/readiness")
 @app.post("/readiness")
 def readiness():
+    if g_objs.args.run_mode == "pd_master":
+        pd_nodes_are_ready = g_objs.httpserver_manager.pd_manager.is_pd_nodes_ready()
+        return JSONResponse(
+            {"status": "ok" if pd_nodes_are_ready else "not ready"},
+            status_code=200 if pd_nodes_are_ready else 503,
+        )
     return {"status": "ok"}
 
 
@@ -156,22 +221,69 @@ def get_model_name():
     return {"model_name": g_objs.args.model_name}
 
 
+@app.get("/get_server_info")
+@app.post("/get_server_info")
+def get_server_info():
+    if is_dataclass(g_objs.args):
+        return asdict(g_objs.args)
+
+    # HTTP workers restore StartArgs from the environment as an EasyDict.
+    return dict(g_objs.args)
+
+
+@app.get("/get_weight_version")
+@app.post("/get_weight_version")
+def get_weight_version():
+    return {"weight_version": getattr(g_objs.httpserver_manager, "rl_active_policy_version", g_objs.args.weight_version)}
+
+
 @app.get("/healthz", summary="Check server health")
 @app.get("/health", summary="Check server health")
 @app.head("/health", summary="Check server health")
 async def healthcheck(request: Request):
-    if g_objs.args.run_mode == "pd_master":
-        return JSONResponse({"message": "Ok"}, status_code=200)
-
     if os.environ.get("DEBUG_HEALTHCHECK_RETURN_FAIL") == "true":
         return JSONResponse({"message": "Error"}, status_code=503)
-    from lightllm.utils.health_check import health_check, health_obj
 
-    health_task = asyncio.create_task(health_check(g_objs.args, g_objs.httpserver_manager, None))
-    if not health_obj.is_health():
-        await health_task
+    if g_objs.args.run_mode == "pd_master":
+        httpserver_manager = g_objs.httpserver_manager
+        pd_manager = httpserver_manager.pd_manager
+        if g_objs.args.pd_master_mode == "elastic":
+            inference_is_healthy = httpserver_manager.is_healthy()
+            pd_nodes_are_ready = pd_manager.is_pd_nodes_ready()
+            is_healthy = inference_is_healthy and pd_nodes_are_ready
+            health_info = {
+                "inference_healthy": inference_is_healthy,
+                "pd_nodes_ready": pd_nodes_are_ready,
+            }
+        else:
+            inference_is_healthy = httpserver_manager.is_healthy()
+            pd_nodes_are_ready = pd_manager.is_pd_nodes_ready()
+            pd_nodes_are_healthy = (
+                inference_is_healthy and pd_nodes_are_ready and await pd_manager.check_pd_nodes_health()
+            )
+            is_healthy = pd_nodes_are_healthy
+            health_info = {
+                "inference_healthy": inference_is_healthy,
+                "pd_nodes_ready": pd_nodes_are_ready,
+                "pd_nodes_healthy": pd_nodes_are_healthy,
+            }
+
+        health_info.update(
+            {
+                "message": "Ok" if is_healthy else "Error",
+                "pd_master_mode": g_objs.args.pd_master_mode,
+                "registered_prefill_nodes": len(pd_manager.prefill_nodes),
+                "registered_decode_nodes": len(pd_manager.decode_nodes),
+            }
+        )
+        return JSONResponse(health_info, status_code=200 if is_healthy else 503)
+
+    from lightllm.utils.health_check import health_check
+
+    is_healthy = health_check(g_objs.httpserver_manager.shm_req_manager)
     return JSONResponse(
-        {"message": "Ok" if health_obj.is_health() else "Error"}, status_code=200 if health_obj.is_health() else 503
+        {"message": "Ok" if is_healthy else "Error"},
+        status_code=200 if is_healthy else 503,
     )
 
 
@@ -200,7 +312,7 @@ async def token_load(request: Request):
 
 @app.post("/generate")
 async def generate(request: Request) -> Response:
-    if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
+    if get_env_start_args().run_mode in ["prefill", "decode"]:
         return create_error_response(
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
         )
@@ -208,8 +320,13 @@ async def generate(request: Request) -> Response:
     try:
         return await g_objs.g_generate_func(request, g_objs.httpserver_manager)
     except ServerBusyError as e:
-        logger.error("%s", str(e), exc_info=True)
-        return create_error_response(HTTPStatus.SERVICE_UNAVAILABLE, str(e))
+        logger.warning("Server busy detail: %s", e.message)
+        return create_server_busy_response(e)
+    except ValueError as e:
+        return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
     except Exception as e:
         logger.error("An error occurred: %s", str(e), exc_info=True)
         return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
@@ -217,7 +334,7 @@ async def generate(request: Request) -> Response:
 
 @app.post("/generate_stream")
 async def generate_stream(request: Request) -> Response:
-    if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
+    if get_env_start_args().run_mode in ["prefill", "decode"]:
         return create_error_response(
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
         )
@@ -225,8 +342,13 @@ async def generate_stream(request: Request) -> Response:
     try:
         return await g_objs.g_generate_stream_func(request, g_objs.httpserver_manager)
     except ServerBusyError as e:
-        logger.error("%s", str(e), exc_info=True)
-        return create_error_response(HTTPStatus.SERVICE_UNAVAILABLE, str(e))
+        logger.warning("Server busy detail: %s", e.message)
+        return create_server_busy_response(e)
+    except ValueError as e:
+        return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
     except Exception as e:
         logger.error("An error occurred: %s", str(e), exc_info=True)
         return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
@@ -234,20 +356,26 @@ async def generate_stream(request: Request) -> Response:
 
 @app.post("/get_score")
 async def get_score(request: Request) -> Response:
-    if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
+    if get_env_start_args().run_mode in ["prefill", "decode"]:
         return create_error_response(
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
         )
 
     try:
         return await lightllm_get_score(request, g_objs.httpserver_manager)
+    except ServerBusyError as e:
+        logger.warning("Server busy detail: %s", e.message)
+        return create_server_busy_response(e)
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
     except Exception as e:
         return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
 
 
 @app.post("/")
 async def compat_generate(request: Request) -> Response:
-    if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
+    if get_env_start_args().run_mode in ["prefill", "decode"]:
         return create_error_response(
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
         )
@@ -260,25 +388,42 @@ async def compat_generate(request: Request) -> Response:
         return await generate(request)
 
 
-# @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-# async def chat_completions(request: ChatCompletionRequest, raw_request: Request) -> Response:
-#     if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
-#         return create_error_response(
-#             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
-#         )
-
-#     resp = await chat_completions_impl(request, raw_request)
-#     return resp
-
-
-@app.post("/v1/completions", response_model=CompletionResponse)
-async def completions(request: CompletionRequest, raw_request: Request) -> Response:
-    if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
+async def chat_completions(request: ChatCompletionRequest, raw_request: Request) -> Response:
+    if get_env_start_args().run_mode in ["prefill", "decode"]:
         return create_error_response(
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
         )
 
-    resp = await completions_impl(request, raw_request)
+    try:
+        resp = await chat_completions_impl(request, raw_request)
+    except ValueError as e:
+        return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
+    except ServerBusyError as e:
+        logger.warning("Server busy detail: %s", e.message)
+        return create_server_busy_response(e)
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
+    return resp
+
+
+@app.post("/v1/completions", response_model=CompletionResponse)
+async def completions(request: CompletionRequest, raw_request: Request) -> Response:
+    if get_env_start_args().run_mode in ["prefill", "decode"]:
+        return create_error_response(
+            HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
+        )
+
+    try:
+        resp = await completions_impl(request, raw_request)
+    except ValueError as e:
+        return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
+    except ServerBusyError as e:
+        logger.warning("Server busy detail: %s", e.message)
+        return create_server_busy_response(e)
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
     return resp
 
 
@@ -316,9 +461,6 @@ async def rl_status():
     return g_objs.httpserver_manager.rl_status()
 
 
-@app.get("/get_weight_version")
-async def get_weight_version():
-    return {"weight_version": g_objs.httpserver_manager.rl_active_policy_version}
 
 
 @app.post("/init_weights_update_group")
@@ -502,6 +644,10 @@ async def stream_rl_traces(websocket: WebSocket):
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def completions_v2(request: ChatCompletionRequestV2, raw_request: Request) -> Response:
+    from lightllm.utils.config_utils import get_model_type_v1
+
+    if get_model_type_v1() != "neo_chat":
+        return await chat_completions(request, raw_request)
     if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
         return create_error_response(
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
@@ -534,20 +680,65 @@ async def completions_v2(request: ChatCompletionRequestV2, raw_request: Request)
 
 @app.post("/v1/messages")
 async def anthropic_messages(raw_request: Request) -> Response:
-    if get_env_start_args().run_mode in ["prefill", "decode", "nixl_prefill", "nixl_decode"]:
+    if get_env_start_args().run_mode in ["prefill", "decode"]:
         return create_error_response(
             HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
         )
-    from .api_anthropic import anthropic_messages_impl
+    from .api_anthropic import _anthropic_error_response, anthropic_messages_impl
 
-    return await anthropic_messages_impl(raw_request)
+    try:
+        return await anthropic_messages_impl(raw_request)
+    except ServerBusyError as e:
+        logger.warning("Server busy detail: %s", e.message)
+        g_objs.metric_client.counter_inc("lightllm_request_failure")
+        return _anthropic_error_response(HTTPStatus(e.status_code), SERVER_BUSY_MESSAGE)
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(raw_request: Request) -> Response:
+    from .api_anthropic import _anthropic_error_response, anthropic_count_tokens_impl
+
+    try:
+        return await anthropic_count_tokens_impl(raw_request)
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
+    except Exception as e:
+        logger.error("An error occurred: %s", str(e), exc_info=True)
+        return _anthropic_error_response(HTTPStatus.EXPECTATION_FAILED, f"error: {str(e)}")
+
+
+@app.post("/v1/responses")
+async def openai_responses(raw_request: Request) -> Response:
+    if get_env_start_args().run_mode in ["prefill", "decode"]:
+        return create_error_response(
+            HTTPStatus.EXPECTATION_FAILED, "service in pd mode dont recv reqs from http interface"
+        )
+    from .api_responses import responses_impl
+
+    try:
+        return await responses_impl(raw_request)
+    except ServerBusyError as e:
+        logger.warning("Server busy detail: %s", e.message)
+        return create_server_busy_response(e)
+    except ValueError as e:
+        return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
+    except Exception as e:
+        logger.error("An error occurred: %s", str(e), exc_info=True)
+        return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
 
 
 @app.get("/v1/models", response_model=ModelListResponse)
-@app.post("/v1/models", response_model=ModelListResponse)
 async def get_models(raw_request: Request):
     model_name = g_objs.args.model_name
-    max_model_len = g_objs.args.max_req_total_len
+    max_model_len = g_objs.httpserver_manager.get_real_supported_max_req_total_len()
+
     if model_name == "default_model_name" and g_objs.args.model_dir:
         model_name = os.path.basename(g_objs.args.model_dir.rstrip("/"))
 
@@ -557,7 +748,7 @@ async def get_models(raw_request: Request):
                 id=model_name,
                 created=g_objs.model_created,
                 max_model_len=max_model_len,
-                owned_by=g_objs.args.model_owner,
+                owned_by=g_objs.args.model_owner or "lightllm",
             )
         ]
     )
@@ -586,6 +777,9 @@ async def tokens(request: Request):
             },
             status_code=200,
         )
+    except ClientDisconnected as e:
+        logger.warning(str(e))
+        return Response(status_code=499)
     except Exception as e:
         return create_error_response(HTTPStatus.EXPECTATION_FAILED, f"error: {str(e)}")
 
@@ -598,48 +792,33 @@ async def metrics() -> Response:
     return response
 
 
-@app.websocket("/pd_register")
-async def register_and_keep_alive(websocket: WebSocket):
-    await websocket.accept()
-    websocket._receive_bytes_max_size = get_lightllm_websocket_max_message_size()
-    client_ip, client_port = websocket.client
-    logger.info(f"Client connected from IP: {client_ip}, Port: {client_port}")
-    regist_json = json.loads(await websocket.receive_text())
-    logger.info(f"received regist_json {regist_json}")
-    await g_objs.httpserver_manager.register_pd(regist_json, websocket)
+# RL 控制面接口（abort / pause / flush / memory / weight update），见 api_http_rl.py
+from .api_http_rl import router as rl_router
 
-    try:
-        while True:
-            # 等待接收消息，设置超时为10秒
-            data = await websocket.receive_bytes()
-            obj = pickle.loads(data)
-            await g_objs.httpserver_manager.put_to_handle_queue(obj)
+app.include_router(rl_router)
 
-    except (WebSocketDisconnect, Exception, RuntimeError) as e:
-        logger.error(f"client {regist_json} has error {str(e)}")
-        logger.exception(str(e))
-    finally:
-        logger.error(f"client {regist_json} removed")
-        await g_objs.httpserver_manager.remove_pd(regist_json)
-    return
+# PD 分离控制面接口（P/D 注册与 KV 状态上报），见 api_http_pd.py
+from .api_http_pd import router as pd_router
+
+app.include_router(pd_router)
 
 
-@app.websocket("/kv_move_status")
-async def kv_move_status(websocket: WebSocket):
-    await websocket.accept()
-    client_ip, client_port = websocket.client
-    logger.info(f"kv_move_status Client connected from IP: {client_ip}, Port: {client_port}")
-    try:
-        while True:
-            # 等待接收消息，设置超时为10秒
-            data = await websocket.receive_bytes()
-            upkv_status = pickle.loads(data)
-            logger.info(f"received upkv_status {upkv_status} from {(client_ip, client_port)}")
-            await g_objs.httpserver_manager.update_req_status(upkv_status)
-    except (WebSocketDisconnect, Exception, RuntimeError) as e:
-        logger.error(f"kv_move_status client {(client_ip, client_port)} has error {str(e)}")
-        logger.exception(str(e))
-    return
+@app.get("/profiler_start")
+async def profiler_start() -> Response:
+    if g_objs.args.enable_profiling:
+        await g_objs.httpserver_manager.profiler_cmd("start")
+        return JSONResponse({"status": "ok"})
+    else:
+        return JSONResponse({"message": "Profiling support not enabled"}, status_code=400)
+
+
+@app.get("/profiler_stop")
+async def profiler_stop() -> Response:
+    if g_objs.args.enable_profiling:
+        await g_objs.httpserver_manager.profiler_cmd("stop")
+        return JSONResponse({"status": "ok"})
+    else:
+        return JSONResponse({"message": "Profiling support not enabled"}, status_code=400)
 
 
 @app.on_event("shutdown")

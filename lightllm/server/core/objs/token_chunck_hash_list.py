@@ -108,3 +108,11 @@ class PastKVCachePageList(CpuCachePageList):
 
     def __repr__(self):
         return f"(token_len={self.token_len}, img_tokens={self.img_tokens}, img_len={self.img_len})"
+
+class TokenPageLenList(CpuCachePageList):
+    """
+    用于记录 CPU cache 每个 page 对应的真实 prefix token 数量，支持 hybrid 模型 CPU cache 的
+    的最后一个页面的非满页面的碎片化处理。
+    """
+
+    pass

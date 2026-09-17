@@ -1,19 +1,23 @@
 import os
 import pytest
 import time
+from unittest.mock import MagicMock
+
 from easydict import EasyDict
 from lightllm.utils.envs_utils import set_env_start_args, get_env_start_args
+from lightllm.utils import shm_utils
 from lightllm.server.core.objs.shm_req_manager import ShmReqManager
 
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_env():
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(shm_utils, "get_unique_server_name", lambda: "test_shm_req_manager_service_0")
     original = os.environ.get("LIGHTLLM_START_ARGS")
     set_env_start_args(
         EasyDict(
             running_max_req_size=10,
             disable_chunked_prefill=True,
-            token_healing_mode=False,
             mtp_step=0,
             llm_prefill_att_backend=["None"],
             llm_decode_att_backend=["None"],
@@ -32,6 +36,7 @@ def setup_env():
         os.environ.pop("LIGHTLLM_START_ARGS", None)
     if hasattr(get_env_start_args, "cache_clear"):
         get_env_start_args.cache_clear()
+    monkeypatch.undo()
 
 
 @pytest.fixture(scope="module")
@@ -67,8 +72,16 @@ def test_get_req_obj_by_index(shm_req_manager):
 def test_put_back_req_obj(shm_req_manager):
     index = shm_req_manager.alloc_req_index()
     req_obj = shm_req_manager.get_req_obj_by_index(index)
+    prompt_ids = req_obj.shm_prompt_ids = MagicMock()
+    logprobs = req_obj.shm_logprobs = MagicMock()
+
     shm_req_manager.put_back_req_obj(req_obj)
+
     assert req_obj.ref_count == 0
+    prompt_ids.detach_shm.assert_called_once_with()
+    logprobs.detach_shm.assert_called_once_with()
+    assert not hasattr(req_obj, "shm_prompt_ids")
+    assert not hasattr(req_obj, "shm_logprobs")
     shm_req_manager.release_req_index(index)
 
 

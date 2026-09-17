@@ -3,7 +3,8 @@ import ctypes
 from typing import Optional, List, Tuple, Union
 from transformers import GenerationConfig
 from lightllm.server.req_id_generator import MAX_BEST_OF
-from .nixl_params import NIXLParamObj
+from lightllm.utils.envs_utils import get_env_start_args
+from .pd_kv_trans_params import PDKVTransParamObj
 
 _SAMPLING_EPS = 1e-5
 DEFAULT_INPUT_PENALTY = os.getenv("INPUT_PENALTY", "False").upper() in ["ON", "TRUE", "1"]
@@ -18,6 +19,8 @@ REGULAR_CONSTRAINT_MAX_LENGTH = int(os.getenv("LIGHTLLM_REGULAR_CONSTRAINT_MAX_L
 GRAMMAR_CONSTRAINT_MAX_LENGTH = int(os.getenv("LIGHTLLM_GRAMMAR_CONSTRAINT_MAX_LENGTH", 2048))
 JSON_SCHEMA_MAX_LENGTH = int(os.getenv("LIGHTLLM_JSON_SCHEMA_MAX_LENGTH", 2048))
 INVALID_TOKEN_IDS_MAX_LENGTH = int(os.getenv("LIGHTLLM_INVALID_TOKEN_IDS_MAX_LENGTH", 10))
+MAX_PROMPT_LOGPROBS = int(os.getenv("LIGHTLLM_MAX_PROMPT_LOGPROBS", 1024))
+MAX_SEED = (1 << 63) - 1
 
 
 class StopSequence(ctypes.Structure):
@@ -30,10 +33,7 @@ class StopSequence(ctypes.Structure):
     ]
 
     def initialize(self, sequence: List[int], sequence_str: Optional[str] = None):
-        self.size = len(sequence)
-        assert self.size <= STOP_SEQUENCE_MAX_LENGTH, "stop token length too long."
-        assert all(isinstance(e, int) for e in sequence), "all must be int"
-        self.sequence[: self.size] = sequence[:]
+        self.size = _check_and_store_int_token_ids(self.sequence, sequence, STOP_SEQUENCE_MAX_LENGTH, "stop token ids")
 
         if sequence_str is not None:
             sequence_str_bytes = sequence_str.encode("utf-8")
@@ -197,10 +197,7 @@ class AllowedTokenIds(ctypes.Structure):
     ]
 
     def initialize(self, ids: List[int]):
-        self.size = len(ids)
-        assert self.size <= ALLOWED_TOKEN_IDS_MAX_LENGTH, "Too many allowed token IDs."
-        assert all(isinstance(e, int) for e in self.ids), "all must be int"
-        self.ids[: self.size] = ids[:]
+        self.size = _check_and_store_int_token_ids(self.ids, ids, ALLOWED_TOKEN_IDS_MAX_LENGTH, "allowed token ids")
 
     def to_list(self):
         return list(self.ids[: self.size])
@@ -214,15 +211,13 @@ class InvalidTokenIds(ctypes.Structure):
     ]
 
     def initialize(self, ids: List[int]):
-        self.size = len(ids)
-        assert (
-            self.size <= INVALID_TOKEN_IDS_MAX_LENGTH
-        ), f"Too many invalid token IDs {self.size} > {INVALID_TOKEN_IDS_MAX_LENGTH}."
-        self.ids[: self.size] = ids[:]
+        self.size = _check_and_store_int_token_ids(self.ids, ids, INVALID_TOKEN_IDS_MAX_LENGTH, "invalid token ids")
         return
 
     def to_list(self):
         return list(self.ids[: self.size])
+
+
 
 
 class ExponentialDecayLengthPenalty(ctypes.Structure):
@@ -260,44 +255,6 @@ class NodeUUId(ctypes.Structure):
         return (self.node_id_high << 64) | self.node_id_low
 
 
-class DecodeNode(ctypes.Structure):
-    _pack_ = 4
-    _fields_ = [
-        ("exists", ctypes.c_bool),
-        ("node_id", NodeUUId),
-        ("ip", ctypes.c_int32 * 4),
-        ("rpyc_port", ctypes.c_int),
-        ("max_new_tokens", ctypes.c_int),
-    ]
-
-    def initialize(self, data_dict):
-        if data_dict is None:
-            self.exists = False
-            return
-
-        self.exists = True
-
-        pd_node_id = data_dict["node_id"]
-        self.node_id = NodeUUId()
-        self.node_id.initialize(pd_node_id)
-
-        ip_parts = [int(part) for part in data_dict["ip"].split(".")]
-        self.ip = (ctypes.c_int32 * 4)(*ip_parts)
-
-        self.rpyc_port = data_dict["rpyc_port"]
-        self.max_new_tokens = data_dict["max_new_tokens"]
-
-    def to_dict(self):
-        if not self.exists:
-            return None
-        return {
-            "node_id": self.node_id.get(),
-            "ip": ".".join(str(self.ip[i]) for i in range(4)),
-            "rpyc_port": self.rpyc_port,
-            "max_new_tokens": self.max_new_tokens,
-        }
-
-
 class SamplingParams(ctypes.Structure):
     _pack_ = 4
     _fields_ = [
@@ -331,12 +288,17 @@ class SamplingParams(ctypes.Structure):
         ("stop_sequences", StopSequenceGroups),
         ("exponential_decay_length_penalty", ExponentialDecayLengthPenalty),
         ("group_request_id", ctypes.c_int64),  # p d mode used params
+        # 由 PD Master 为分段续跑或预计 cache 命中率较高的请求设置，表示请求需
+        # 以高优先级插入 Router 调度队列。
+        ("pd_high_priority_request", ctypes.c_bool),
+        # P/D 节点的资源等待超时，由 PD Master 下发。非负值用于控制 shm_req 申请和
+        # Router 等待进入推理系统的时限；负数表示永久等待。
+        ("pd_node_resource_wait_timeout_seconds", ctypes.c_int),
         ("suggested_dp_index", ctypes.c_int),  # suggest dp index, deepseekv2 dp mode, use to suggest used dp_index
-        ("move_kv_to_decode_node", DecodeNode),  # move kv to deocde node, only used in pd mode
         # in pd split mode, use to keep the id of pd master
         ("pd_master_node_id", NodeUUId),
-        # nixl params object, only used in nixl pd mode, used to build nixl connection in p and d
-        ("nixl_params", NIXLParamObj),
+        # pd params object, only used in pd mode, used to build kv transport connection in prefill and decode
+        ("pd_kv_trans_params", PDKVTransParamObj),
         ("skip_special_tokens", ctypes.c_bool),  # whether to skip special tokens when decoding
         ("add_special_tokens", ctypes.c_bool),  # whether to add special tokens when encoding
         (
@@ -347,6 +309,9 @@ class SamplingParams(ctypes.Structure):
         ("disable_prompt_cache", ctypes.c_bool),  # whether to disable prompt cache
         ("seed", ctypes.c_int64),  # random seed
         ("img_gen_prefill", ctypes.c_bool),  # whether to prefill for image generation, need return past key values back
+
+        # -1 disables prompt logprobs; K >= 0 returns only the top-K prompt tokens.
+        ("prompt_logprobs", ctypes.c_int),
     ]
 
     _do_sample: bool = False
@@ -372,10 +337,13 @@ class SamplingParams(ctypes.Structure):
         self.image_max_patch_num = kwargs.get("image_max_patch_num", -1)
         self.min_pixels = kwargs.get("min_pixels", -1)
         self.max_pixels = kwargs.get("max_pixels", -1)
-        self.max_new_tokens = kwargs.get("max_new_tokens", 16384)
+        self.max_new_tokens = kwargs.get("max_new_tokens", 65535)
         self.min_new_tokens = kwargs.get("min_new_tokens", 1)
         self.input_penalty = kwargs.get("input_penalty", DEFAULT_INPUT_PENALTY)
         self.group_request_id = kwargs.get("group_request_id", -1)
+        # 这两个字段是 PD Master 的内部调度信息，不能由外部请求参数开启或修改。
+        self.pd_high_priority_request = False
+        self.pd_node_resource_wait_timeout_seconds = -1
         self.suggested_dp_index = kwargs.get("suggested_dp_index", -1)
 
         self.skip_special_tokens = kwargs.get("skip_special_tokens", SKIP_SPECIAL_TOKENS)
@@ -386,15 +354,16 @@ class SamplingParams(ctypes.Structure):
         self.add_special_tokens = kwargs.get("add_special_tokens", True)
         self.add_spaces_between_special_tokens = kwargs.get("add_spaces_between_special_tokens", True)
         self.print_eos_token = kwargs.get("print_eos_token", False)
-        self.seed = kwargs.get("seed", -1)
+        # ctypes silently wraps overflowing integers assigned to c_int64.
+        self.seed = self._normalize_and_verify_seed(kwargs.get("seed"))
+        prompt_logprobs = kwargs.get("prompt_logprobs", None)
+        self.prompt_logprobs = -1 if prompt_logprobs is None else int(prompt_logprobs)
 
         self.exponential_decay_length_penalty = ExponentialDecayLengthPenalty()
         self.exponential_decay_length_penalty.initialize(kwargs.get("exponential_decay_length_penalty", (1, 1.0)))
 
-        self.move_kv_to_decode_node = DecodeNode()
-        self.move_kv_to_decode_node.initialize(kwargs.get("move_kv_to_decode_node", None))
-        self.nixl_params = NIXLParamObj()
-        self.nixl_params.set(kwargs.get("nixl_params", None))
+        self.pd_kv_trans_params = PDKVTransParamObj()
+        self.pd_kv_trans_params.set(kwargs.get("pd_kv_trans_params", None))
         self.pd_master_node_id = NodeUUId()
         self.pd_master_node_id.initialize(kwargs.get("pd_master_node_id", 0))
 
@@ -424,7 +393,7 @@ class SamplingParams(ctypes.Structure):
         self.allowed_token_ids.initialize(allowed_token_ids)
 
         # Initialize invalid_token_ids
-        invalid_token_ids = kwargs.get("invalid_token_ids", [])
+        invalid_token_ids = list(dict.fromkeys([*kwargs.get("invalid_token_ids", []), *map(int, kwargs.get("logit_bias", {}).keys())]))
         self.invalid_token_ids = InvalidTokenIds()
         self.invalid_token_ids.initialize(invalid_token_ids)
 
@@ -447,15 +416,18 @@ class SamplingParams(ctypes.Structure):
     def load_generation_cfg(cls, weight_dir):
         try:
             generation_cfg = GenerationConfig.from_pretrained(weight_dir, trust_remote_code=True).to_dict()
-            cls._do_sample = generation_cfg.get("do_sample", False)
-            cls._presence_penalty = generation_cfg.get("presence_penalty", 0.0)
-            cls._frequency_penalty = generation_cfg.get("frequency_penalty", 0.0)
-            cls._repetition_penalty = generation_cfg.get("repetition_penalty", 1.0)
-            if cls._repetition_penalty is None:
-                cls._repetition_penalty = 1.0
-            cls._temperature = generation_cfg.get("temperature", 1.0)
-            cls._top_p = generation_cfg.get("top_p", 1.0)
-            cls._top_k = generation_cfg.get("top_k", -1)
+
+            def _cfg(key, default):
+                v = generation_cfg.get(key)
+                return v if v is not None else default
+
+            cls._do_sample = _cfg("do_sample", False)
+            cls._presence_penalty = _cfg("presence_penalty", 0.0)
+            cls._frequency_penalty = _cfg("frequency_penalty", 0.0)
+            cls._repetition_penalty = _cfg("repetition_penalty", 1.0)
+            cls._temperature = _cfg("temperature", 1.0)
+            cls._top_p = _cfg("top_p", 1.0)
+            cls._top_k = _cfg("top_k", -1)
         except:
             pass
 
@@ -486,10 +458,21 @@ class SamplingParams(ctypes.Structure):
             raise ValueError(
                 f"min_new_tokens must <= max_new_tokens, but got min {self.min_new_tokens}, max {self.max_new_tokens}."
             )
+        if self.prompt_logprobs < -1 or self.prompt_logprobs > MAX_PROMPT_LOGPROBS:
+            raise ValueError(f"prompt_logprobs must be in [-1, {MAX_PROMPT_LOGPROBS}], got {self.prompt_logprobs}")
+        if self.prompt_logprobs >= 0 and not get_env_start_args().enable_prompt_logprobs:
+            raise ValueError("prompt_logprobs requires --enable_prompt_logprobs")
         self._verify_allowed_token_ids()
         self._verify_grammar_constraint()
 
         return
+
+    @staticmethod
+    def _normalize_and_verify_seed(seed: Optional[int]) -> int:
+        seed = -1 if seed is None else seed
+        if not -1 <= seed <= MAX_SEED:
+            raise ValueError(f"seed must be -1 (random), or an integer in [0, {MAX_SEED}], got {seed}")
+        return seed
 
     def _verify_grammar_constraint(self):
         if self.guided_grammar.length != 0:
@@ -534,13 +517,15 @@ class SamplingParams(ctypes.Structure):
             "allowed_token_ids": self.allowed_token_ids.to_list(),
             "invalid_token_ids": self.invalid_token_ids.to_list(),
             "group_request_id": self.group_request_id,
-            "move_kv_to_decode_node": self.move_kv_to_decode_node.to_dict(),
+            "pd_high_priority_request": self.pd_high_priority_request,
+            "pd_node_resource_wait_timeout_seconds": self.pd_node_resource_wait_timeout_seconds,
             "skip_special_tokens": self.skip_special_tokens,
             "add_special_tokens": self.add_special_tokens,
             "add_spaces_between_special_tokens": self.add_spaces_between_special_tokens,
             "print_eos_token": self.print_eos_token,
             "disable_prompt_cache": self.disable_prompt_cache,
             "seed": self.seed,
+            "prompt_logprobs": self.prompt_logprobs,
         }
 
     def to_origin_dict(self):
@@ -548,3 +533,26 @@ class SamplingParams(ctypes.Structure):
         ret["group_request_id"] = self.group_request_id
         ret["suggested_dp_index"] = self.suggested_dp_index
         return ret
+
+
+def _check_and_store_int_token_ids(dst, ids: List[int], max_length: int, name: str) -> int:
+    """Validate a caller-supplied list of token ids and copy it into a fixed-size ctypes ``c_int`` array.
+
+    The type check runs against the input ``ids`` (not the zero-filled destination buffer), so a non-int
+    entry fails fast with a clear message instead of surfacing an opaque ctypes ``TypeError`` at the
+    assignment below.
+
+    Args:
+        dst: destination ctypes array, declared as ``c_int * max_length``.
+        ids: caller-supplied token ids; every element must be an ``int``.
+        max_length: capacity of ``dst``.
+        name: field name used in the error messages.
+
+    Returns:
+        The number of ids written, i.e. ``len(ids)``.
+    """
+    size = len(ids)
+    assert size <= max_length, f"Too many {name}: {size} > {max_length}."
+    assert all(isinstance(e, int) for e in ids), f"all {name} must be int."
+    dst[:size] = ids[:]
+    return size

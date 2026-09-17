@@ -1,3 +1,4 @@
+from lightllm.utils.shm_port_args import get_shm_port_args
 import zmq
 import asyncio
 import uvloop
@@ -46,14 +47,14 @@ class X2IManager:
 
         # from http server
         self.zmq_recv_socket = context.socket(zmq.PULL)
-        self.zmq_recv_socket.bind(f"{args.zmq_mode}127.0.0.1:{args.x2i_port}")
+        self.zmq_recv_socket.bind(f"{args.zmq_mode}127.0.0.1:{get_shm_port_args().x2i_port}")
 
         # to http server
         self.send_to_httpserver = context.socket(zmq.PUSH)
-        self.send_to_httpserver.connect(f"{args.zmq_mode}127.0.0.1:{args.http_server_port_for_x2i}")
+        self.send_to_httpserver.connect(f"{args.zmq_mode}127.0.0.1:{get_shm_port_args().http_server_port_for_x2i}")
         self.send_rl_control_response = context.socket(zmq.PUSH)
         self.send_rl_control_response.connect(
-            f"{args.zmq_mode}127.0.0.1:{args.rl_control_response_port}"
+            f"{args.zmq_mode}127.0.0.1:{get_shm_port_args().rl_control_response_port}"
         )
 
         self.use_naive_x2i = args.x2i_use_naive_impl
@@ -62,7 +63,7 @@ class X2IManager:
         if not self.use_naive_x2i and self.world_size > 1:
             # send to workers
             self.worker_pub = context.socket(zmq.PUSH)
-            self.worker_pub.bind(f"{args.zmq_mode}127.0.0.1:{args.x2i_worker_task_port}")
+            self.worker_pub.bind(f"{args.zmq_mode}127.0.0.1:{get_shm_port_args().x2i_worker_task_port}")
 
         self.waiting_reqs: List[X2IParams] = []
 

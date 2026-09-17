@@ -1,5 +1,6 @@
 from typing import List
 from lightllm.models.mistral.model import MistralTpPartModel
+from lightllm.models.draft_registry import DraftModelRegistry
 from lightllm.models.mistral_mtp.layer_weights.pre_and_post_layer_weight import MistralMTPPreAndPostLayerWeight
 from lightllm.models.mistral_mtp.layer_infer.pre_layer_infer import MistralMTPPreLayerInfer
 from lightllm.models.mistral_mtp.layer_infer.post_layer_infer import MistralMTPPostLayerInfer
@@ -8,7 +9,14 @@ from lightllm.models.mistral_mtp.layer_weights.transformer_layer_weight import M
 from lightllm.common.basemodel import TpPartBaseModel
 
 
+@DraftModelRegistry(
+    model_type="mistral",
+    spec_modes=("vanilla_no_att", "eagle_no_att"),
+)
 class MistralMTPModel(MistralTpPartModel):
+
+    # MTP draft model marker (consumed by the decode CUDA-graph / padding paths).
+    is_mtp_draft_model = True
 
     pre_and_post_weight_class = MistralMTPPreAndPostLayerWeight
     pre_layer_infer_class = MistralMTPPreLayerInfer

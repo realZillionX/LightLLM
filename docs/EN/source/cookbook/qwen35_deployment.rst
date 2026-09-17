@@ -69,10 +69,21 @@ Deploy the full multimodal MoE model on 8 GPUs:
 - ``--tp 8``: Tensor parallelism across 8 GPUs (required for 397B parameter model)
 - ``--max_req_total_len 262144``: Maximum total request length matching the model's native 262K context
 - ``--chunked_prefill_size 8192``: Chunk size for prefill processing, reduces peak memory usage
-- ``--llm_prefill_att_backend fa3``: Use FlashAttention3 for prefill (recommended for H200)
-- ``--llm_decode_att_backend flashinfer``: Use FlashInfer for decode phase
+- ``--llm_prefill_att_backend fa3``: Use FlashAttention3 for full-attention prefill; automatically select the linear-attention prefill backend
+- ``--llm_decode_att_backend flashinfer``: Use FlashInfer for full-attention decode; automatically select the linear-attention decode backend
 - ``--graph_max_batch_size 128``: Maximum batch size for CUDA graph optimization (reduce if OOM)
 - ``--reasoning_parser qwen3``: Enable Qwen3 reasoning parser for thinking mode
+
+Linear-Attention Cache Tuning Notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Qwen3.5 uses a hybrid attention architecture. For linear-attention cache reuse, pay attention to:
+
+- ``--linear_att_hash_page_size``: small-page granularity (tokens per hash bucket)
+- ``--linear_att_page_block_num``: block-level matching related setting. Block size can be approximated as ``linear_att_page_block_num * linear_att_hash_page_size``.
+- When ``linear_att_page_block_num * linear_att_hash_page_size > max_req_total_len``, block-level matching in radix cache is effectively disabled, and request-level small-page matching (small page size is ``linear_att_hash_page_size``) becomes dominant.
+- Under high load, limited small-page capacity plus internal LRU eviction can reduce hit rate. In this case, increasing ``--linear_att_cache_size`` can improve hit rate, at the cost of more memory usage.
+- When ``--enable_cpu_cache`` is enabled, CPU cache page size is forced to ``linear_att_page_block_num * linear_att_hash_page_size`` to satisfy internal reuse constraints.
 
 Text-only Mode (Save Memory)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

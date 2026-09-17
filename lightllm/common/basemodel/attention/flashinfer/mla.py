@@ -3,11 +3,16 @@ import torch
 from ..base_att import BaseAttBackend, BasePrefillAttState, BaseDecodeAttState, AttControl
 from lightllm.utils.dist_utils import get_dp_world_size, get_current_device_id
 from ...triton_kernel.repack_kv_index import repack_kv_index
+from ...triton_kernel.flashinfer_mla_plan import fill_mla_decode_plan_for_cuda_graph
 from typing import Tuple
 from .env_utils import set_flashinfer_envs
+from .utils import should_init_decode_wrapper
 
 
 class MlaFlashInferAttBackend(BaseAttBackend):
+    workspace_buffer_key = "flashinfer_mla"
+    workspace_buffer_size = 256 * 1024 * 1024
+
     def __init__(self, model):
         set_flashinfer_envs()
         super().__init__(model=model)
@@ -19,7 +24,6 @@ class MlaFlashInferAttBackend(BaseAttBackend):
         self.v_head_dim = model.v_head_dim
         self.q_data_type = model.data_type
         self.kv_data_type = model.data_type
-        self.workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=get_current_device_id())
         self.max_seq_length = model.max_seq_length
         self.softmax_scale = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** (-0.5)
         self.kv_indices_buffer = [
@@ -62,7 +66,11 @@ class MlaFlashInferPrefillAttState(BasePrefillAttState):
         kv_starts = self.infer_state.b1_cu_kv_seq_len.int()
         if self.prefill_wrapper is None:
             self.prefill_wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-                self.backend.workspace_buffer, "NHD"
+                self.backend.get_gpu_workspace_buffer(
+                    key_name=self.backend.workspace_buffer_key,
+                    workspace_size=self.backend.workspace_buffer_size,
+                ),
+                "NHD",
             )
         self.prefill_wrapper.plan(
             qo_indptr=q_starts,
@@ -113,7 +121,11 @@ class MlaFlashInferPrefillAttState(BasePrefillAttState):
 class MlaFlashInferDecodeAttState(BaseDecodeAttState):
     kv_indices: torch.Tensor = None
     kv_starts: torch.Tensor = None
+    q_indptr_host: torch.Tensor = None
     decode_wrapper: object = None
+
+    def _should_init_decode_wrapper(self) -> bool:
+        return should_init_decode_wrapper(self.backend.model, self.infer_state)
 
     def init_state(self):
         import flashinfer
@@ -126,6 +138,7 @@ class MlaFlashInferDecodeAttState(BaseDecodeAttState):
         self.kv_starts = self.infer_state.b1_cu_kv_seq_len
 
         self.q_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+        self.q_indptr_host = torch.arange(batch_size + 1, dtype=torch.int32, device="cpu")
         if batch_size <= model.graph_max_batch_size and self.infer_state.max_kv_seq_len <= model.graph_max_len_in_batch:
             self.kv_indices = self.backend.kv_indices_buffer[self.infer_state.microbatch_index][
                 : batch_size * self.backend.max_seq_length
@@ -145,10 +158,17 @@ class MlaFlashInferDecodeAttState(BaseDecodeAttState):
             self.infer_state.max_kv_seq_len,
             self.kv_indices,
         )
+
+        if not self._should_init_decode_wrapper():
+            return
+
         assert self.decode_wrapper is None
 
         self.decode_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-            self.backend.workspace_buffer,
+            self.backend.get_gpu_workspace_buffer(
+                key_name=self.backend.workspace_buffer_key,
+                workspace_size=self.backend.workspace_buffer_size,
+            ),
             use_cuda_graph=True,
             qo_indptr=self.q_indptr,
             kv_indices=self.kv_indices,
@@ -173,19 +193,18 @@ class MlaFlashInferDecodeAttState(BaseDecodeAttState):
 
     def copy_for_decode_cuda_graph(self, new_state: "MlaFlashInferDecodeAttState"):
         super().copy_for_decode_cuda_graph(new_state)
-        self.decode_wrapper.plan(
-            new_state.q_indptr,
-            new_state.kv_starts,
-            new_state.kv_indices,
-            new_state.infer_state.b_seq_len,
-            new_state.backend.tp_q_head_num,
-            new_state.backend.kv_lora_rank,
-            new_state.backend.qk_rope_head_dim,
-            1,
-            False,  # causal
-            new_state.backend.softmax_scale,
-            new_state.backend.q_data_type,
-            new_state.backend.kv_data_type,
+        self._refresh_cuda_graph_decode_plan(new_state.infer_state.max_kv_seq_len)
+        return
+
+    def _refresh_cuda_graph_decode_plan(self, max_kv_len: int):
+        # Prefer the GPU-generated split plan for long decode; use exact non-split for
+        # short or unsupported graph shapes.
+        fill_mla_decode_plan_for_cuda_graph(
+            self.decode_wrapper,
+            self.kv_starts,
+            self.infer_state.batch_size,
+            self.backend.tp_q_head_num,
+            max_kv_len,
         )
 
     def decode_att(

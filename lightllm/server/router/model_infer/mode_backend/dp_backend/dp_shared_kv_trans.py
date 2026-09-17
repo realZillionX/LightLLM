@@ -5,7 +5,7 @@ import dataclasses
 import torch
 from typing import List
 from lightllm.common.kv_cache_mem_manager import MemoryManager
-from lightllm.utils.envs_utils import get_unique_server_name, get_env_start_args
+from lightllm.utils.envs_utils import get_env_start_args
 from lightllm.utils.dist_utils import get_dp_rank_in_node
 from lightllm.server.core.objs.shm_array import ShmArray
 from ...infer_batch import InferReq
@@ -18,16 +18,15 @@ class DPKVSharedMoudle:
     _KV_LEN_INDEX = 0
     _REQ_IDX_INDEX = 1
 
-    def __init__(self, max_req_num: int, max_req_seq_len: int, dp_size_in_node: int, backend):
+    def __init__(self, max_req_num: int, dp_size_in_node: int, backend):
         from .impl import DPChunkedPrefillBackend
 
         self.backend: DPChunkedPrefillBackend = backend
         self.max_req_num = max_req_num
-        self.max_req_seq_len = max_req_seq_len
 
         # 0 代表 kv_len, 1 代表 radix_cache_len
         self.shared_req_infos = ShmArray(
-            name=f"{get_unique_server_name()}_dp_shared_req_infos",
+            name="dp_shared_req_infos",
             shape=(self.max_req_num, dp_size_in_node, 2),
             dtype=np.int64,
         )
@@ -111,7 +110,7 @@ class DPKVSharedMoudle:
             max_kv_len_mem_indexes_tensor = torch.cat(max_kv_len_mem_indexes).to(dtype=torch.int64, device="cuda")
             max_kv_len_dp_ranks_tensor = torch.tensor(max_kv_len_dp_ranks, dtype=torch.int32, device="cuda")
             mem_indexes_tensor = torch.cat(mem_indexes).to(dtype=torch.int64, device="cuda")
-            self.backend.model.mem_manager.copy_kv_from_other_dp_ranks(
+            self.backend.model.mem_manager.operator.copy_kv_from_other_dp_ranks(
                 mem_managers=self.backend.mem_managers,
                 move_token_indexes=max_kv_len_mem_indexes_tensor,
                 token_dp_indexes=max_kv_len_dp_ranks_tensor,
