@@ -4,6 +4,7 @@ from lightllm.server.tokenizer import get_tokenizer
 from lightllm.utils.log_utils import init_logger
 from functools import lru_cache
 from lightllm.utils.config_utils import get_model_type_v1
+from lightllm.utils.envs_utils import get_env_start_args
 
 logger = init_logger(__name__)
 
@@ -183,8 +184,11 @@ async def build_prompt(request, tools) -> str:
 
     thinking = _is_force_thinking_mode(request)
 
-    kwargs["thinking"] = thinking
-    kwargs["enable_thinking"] = thinking
+    # Parsing reasoning channels must not override the caller's template policy.
+    # Without a parser, retain the model template's own defaults (e.g. NeoPP).
+    if get_env_start_args().reasoning_parser:
+        kwargs.setdefault("thinking", thinking)
+        kwargs.setdefault("enable_thinking", thinking)
 
     # TODO thinking 模式应该是3种，一种是强制思考，一种是强制不思考，一种是模型自己决定的自适应
     # 的思考模式。当前的代码只是实现了强制思考和强制不思考两种模式。后续要根据模型的情况，从tokenizer
