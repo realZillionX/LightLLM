@@ -1,0 +1,14 @@
+name: Serving contract
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s unit_tests/server -p test_cli_start_args.py
+      - run: python -m unittest discover -s unit_tests/server -p test_trajectory_budget.py
