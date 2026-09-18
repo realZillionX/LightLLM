@@ -12,4 +12,5 @@ jobs:
           python-version: '3.12'
       - run: python -m unittest discover -s unit_tests/server -p test_cli_start_args.py
       - run: python -m unittest discover -s unit_tests/server -p test_neo_visual_defaults.py
+      - run: python -m unittest discover -s unit_tests/server -p test_past_kv_attach.py
       - run: python -m unittest discover -s unit_tests/server -p test_trajectory_budget.py

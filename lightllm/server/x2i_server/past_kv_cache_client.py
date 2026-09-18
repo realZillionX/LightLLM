@@ -2,9 +2,8 @@ import ctypes
 import torch
 import numpy as np
 from threading import Lock, Condition
-from dataclasses import dataclass
 from lightllm.utils.envs_utils import get_env_start_args
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from lightllm.utils.log_utils import init_logger
 from lightllm.utils.kv_cache_utils import (
     calcu_cpu_cache_meta,
@@ -38,10 +37,8 @@ class PastKVCacheClient(object):
         if not only_create_meta_data:
             if init_shm_data:
                 self._create_shm_cpu_kv_cache()
-                self.attach_shm_handle = None
             else:
-                self.attach_shm_handle = self._attach_shm_cpu_kv_cache()
-                self.attach_shm_handle.wait()
+                self._attach_shm_cpu_kv_cache()
         return
 
     def allocate_pages(self, req_id: int, need_tokens: int, img_tokens: int = 0, img_len: int = 0) -> List[int]:
@@ -128,7 +125,7 @@ class PastKVCacheClient(object):
         shm_ptr = attach_shm_kv_cache_ptr(
             key=self.args.multi_modal_x2i_cache_shm_id, size=self.kv_cache_tensor_meta.calcu_size()
         )
-        handle = register_shm_ptr_to_pin(shm_ptr=shm_ptr, size=self.kv_cache_tensor_meta.calcu_size())
+        register_shm_ptr_to_pin(shm_ptr=shm_ptr, size=self.kv_cache_tensor_meta.calcu_size())
         numpy_array = np.frombuffer(
             memoryview((ctypes.c_uint8 * self.kv_cache_tensor_meta.calcu_size()).from_address(shm_ptr)), dtype=np.uint8
         )
@@ -144,4 +141,4 @@ class PastKVCacheClient(object):
         )
         assert shm_ptr == self.cpu_kv_cache_tensor.data_ptr()
 
-        return handle
+        return
